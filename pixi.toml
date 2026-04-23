@@ -1,0 +1,19 @@
+[workspace]
+channels = ["conda-forge", "bioconda"]
+name = "39-Species-Estimates"
+platforms = ["linux-64"]
+
+[environments]
+default = ["main"]
+
+[feature.main.dependencies]
+python = ">=3.8"
+biopython = "*"
+gffutils = "*"
+bcbiogff = "*"
+extern = "*"
+bird_tool_utils_python = "*"
+snakemake = ">=8"
+snakemake-executor-plugin-cluster-generic = ">=1"
+polars = "*"
+xlsx2csv = "*"
