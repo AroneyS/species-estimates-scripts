@@ -10,7 +10,6 @@
 #      2. Filter off-target OTUs (domain mismatch for the marker)
 #      3. Order by GlobDB-known taxonomy first, then num_hits descending
 #      4. Per marker: smafa cluster --max-divergence 2
-#      5. (Optional) Per marker: smafa query all OTUs against rep set
 #
 #    With --run-through-mqsub:
 #      - Steps 1-3 run locally, writing per-marker FASTA files
@@ -180,52 +179,37 @@ def otus_to_fasta(otus):
 
 def run_smafa_cluster(fasta_str, max_divergence, marker_name):
     """
-    Run smafa cluster on fasta_str (passed via stdin).
+    Run smafa cluster on fasta_str (passed via a temp file).
     Returns the stdout string (clusters TSV).
     """
-    cmd = ["smafa", "cluster", "--max-divergence", str(max_divergence), "-"]
-    logging.debug(f"[{marker_name}] Running: {' '.join(cmd)}")
-    result = subprocess.run(
-        cmd,
-        input=fasta_str,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"smafa cluster failed for marker {marker_name}:\n{result.stderr}"
-        )
-    return result.stdout
-
-
-def run_smafa_query(query_fasta_str, rep_fasta_str, marker_name):
-    """
-    Run smafa query of all OTUs against the representative set.
-    Uses temporary files for the rep set (smafa query requires a file for the db).
-    Returns the stdout string.
-    """
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".fasta", prefix=f"smafa_reps_{marker_name}_", delete=False
-    ) as rep_f:
-        rep_f.write(rep_fasta_str)
-        rep_path = rep_f.name
+        mode="w", suffix=".fasta", prefix=f"smafa_cluster_{marker_name}_", delete=False
+    ) as fasta_f:
+        fasta_f.write(fasta_str)
+        fasta_path = fasta_f.name
 
     try:
-        cmd = ["smafa", "query", rep_path, "-"]
-        logging.debug(f"[{marker_name}] Running query: {' '.join(cmd)}")
+        cmd = [
+            "smafa",
+            "cluster",
+            "--max-divergence",
+            str(max_divergence),
+            "--input",
+            fasta_path,
+        ]
+        logging.debug(f"[{marker_name}] Running: {' '.join(cmd)}")
         result = subprocess.run(
             cmd,
-            input=query_fasta_str,
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
             raise RuntimeError(
-                f"smafa query failed for marker {marker_name}:\n{result.stderr}"
+                f"smafa cluster failed for marker {marker_name}:\n{result.stderr}"
             )
         return result.stdout
     finally:
-        os.unlink(rep_path)
+        os.unlink(fasta_path)
 
 
 # ---------------------------------------------------------------------------
@@ -236,11 +220,11 @@ def process_marker(args_tuple):
     """
     Worker function for one marker.
 
-    args_tuple: (marker_name, fasta_str, max_divergence, do_query)
+    args_tuple: (marker_name, fasta_str, max_divergence)
 
-    Returns (marker_name, cluster_tsv, query_tsv_or_None, rep_fasta).
+    Returns (marker_name, cluster_tsv, rep_fasta).
     """
-    (marker_name, fasta_str, max_divergence, do_query) = args_tuple
+    (marker_name, fasta_str, max_divergence) = args_tuple
 
     if not fasta_str or not fasta_str.strip():
         logging.warning(f"[{marker_name}] Empty FASTA — skipping.")
@@ -280,15 +264,8 @@ def process_marker(args_tuple):
             rep_fasta_lines.append("".join(current_seq_parts))
     rep_fasta = "\n".join(rep_fasta_lines) + "\n"
 
-    query_tsv = None
-    if do_query:
-        logging.info(
-            f"[{marker_name}] Querying {num_seqs} OTU(s) against {len(rep_ids)} rep(s) ..."
-        )
-        query_tsv = run_smafa_query(fasta_str, rep_fasta, marker_name)
-
     logging.info(f"[{marker_name}] Done — {len(rep_ids)} cluster(s) from {num_seqs} OTU(s).")
-    return (marker_name, cluster_tsv, query_tsv, rep_fasta)
+    return (marker_name, cluster_tsv, rep_fasta)
 
 
 # ---------------------------------------------------------------------------
@@ -519,17 +496,17 @@ def _header_sort_key(header):
 # Phase 2: cluster locally (multiprocessing across markers)
 # ---------------------------------------------------------------------------
 
-def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads, do_query):
-    """Run smafa cluster (and optionally query) for each marker in parallel."""
+def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads):
+    """Run smafa cluster for each marker in parallel."""
 
     def _load_and_process(args_tuple):
-        (marker_name, fasta_path, max_divergence, do_query) = args_tuple
+        (marker_name, fasta_path, max_divergence) = args_tuple
         with open(fasta_path) as fh:
             fasta_str = fh.read()
-        return process_marker((marker_name, fasta_str, max_divergence, do_query))
+        return process_marker((marker_name, fasta_str, max_divergence))
 
     worker_args = [
-        (marker, path, max_divergence, do_query)
+        (marker, path, max_divergence)
         for marker, path in marker_to_fasta.items()
     ]
 
@@ -546,9 +523,9 @@ def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads
 
 
 def _write_cluster_results(results, marker_to_fasta, output_dir):
-    """Write cluster TSV, rep FASTA, and optional query TSV; write summary."""
+    """Write cluster TSV, rep FASTA; write summary."""
     summary_rows = []
-    for (marker_name, cluster_tsv, query_tsv, rep_fasta) in results:
+    for (marker_name, cluster_tsv, rep_fasta) in results:
         marker_dir = os.path.join(output_dir, marker_name)
         os.makedirs(marker_dir, exist_ok=True)
 
@@ -556,9 +533,6 @@ def _write_cluster_results(results, marker_to_fasta, output_dir):
             fh.write(cluster_tsv)
         with open(os.path.join(marker_dir, "representatives.fasta"), "w") as fh:
             fh.write(rep_fasta)
-        if query_tsv is not None:
-            with open(os.path.join(marker_dir, "query.tsv"), "w") as fh:
-                fh.write(query_tsv)
 
         num_clusters = sum(1 for ln in cluster_tsv.splitlines() if ln.strip())
         fasta_path = marker_to_fasta.get(marker_name, "")
@@ -584,9 +558,9 @@ def _write_cluster_results(results, marker_to_fasta, output_dir):
 # ---------------------------------------------------------------------------
 
 def cluster_markers_via_mqsub(
-    marker_to_fasta, output_dir, max_divergence, do_query, this_script_path
+    marker_to_fasta, output_dir, max_divergence, this_script_path
 ):
-    """Submit one mqsub job per marker for smafa cluster (and optional query)."""
+    """Submit one mqsub job per marker for smafa cluster."""
     logging.info(
         f"Submitting {len(marker_to_fasta)} smafa cluster job(s) via mqsub ..."
     )
@@ -604,8 +578,6 @@ def cluster_markers_via_mqsub(
                 f" --output-directory {abs_output_dir}"
                 f" --max-divergence {max_divergence}"
             )
-            if do_query:
-                cmd += " --query"
             cmd_file.write(cmd + "\n")
 
     try:
@@ -669,11 +641,11 @@ def worker_extract_sample(archive_path, marker_domains_tsv, sample_fasta_dir, ma
     logging.info(f"Extracted {len(seen)} marker(s) from {archive_path}")
 
 
-def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence, do_query):
+def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence):
     """Entry point for per-marker smafa cluster mqsub jobs."""
     with open(fasta_path) as fh:
         fasta_str = fh.read()
-    result = process_marker((marker_name, fasta_str, max_divergence, do_query))
+    result = process_marker((marker_name, fasta_str, max_divergence))
     _write_cluster_results([result], {marker_name: fasta_path}, output_dir)
     logging.info(f"[{marker_name}] Cluster job complete.")
 
@@ -688,7 +660,6 @@ def collate_and_cluster(
     output_dir,
     max_divergence,
     threads,
-    do_query,
     markers_of_interest,
     run_through_mqsub,
     this_script_path,
@@ -716,7 +687,7 @@ def collate_and_cluster(
             return
         # Phase 3: submit one smafa cluster job per marker
         cluster_markers_via_mqsub(
-            marker_to_fasta, output_dir, max_divergence, do_query, this_script_path
+            marker_to_fasta, output_dir, max_divergence, this_script_path
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
@@ -744,7 +715,7 @@ def collate_and_cluster(
             logging.warning("No markers with sequences — nothing to cluster.")
             return
         cluster_markers_locally(
-            marker_to_fasta, output_dir, max_divergence, threads, do_query
+            marker_to_fasta, output_dir, max_divergence, threads
         )
 
     logging.info("Done.")
@@ -809,14 +780,6 @@ if __name__ == "__main__":
         help="Number of markers to process in parallel when not using mqsub (default: 1)",
     )
     parser.add_argument(
-        "--query",
-        action="store_true",
-        help=(
-            "After clustering, run smafa query to assign every OTU to its "
-            "nearest representative sequence"
-        ),
-    )
-    parser.add_argument(
         "--markers",
         nargs="+",
         metavar="MARKER",
@@ -877,7 +840,6 @@ if __name__ == "__main__":
             marker_name=args._marker_name,
             output_dir=args.output_directory,
             max_divergence=args.max_divergence,
-            do_query=args.query,
         )
         sys.exit(0)
 
@@ -899,7 +861,6 @@ if __name__ == "__main__":
         output_dir=args.output_directory,
         max_divergence=args.max_divergence,
         threads=args.threads,
-        do_query=args.query,
         markers_of_interest=set(args.markers) if args.markers else None,
         run_through_mqsub=args.run_through_mqsub,
         this_script_path=_this_script,
