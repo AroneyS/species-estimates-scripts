@@ -344,6 +344,14 @@ def _sample_fasta_dir(output_dir, archive_path):
     return os.path.join(output_dir, SAMPLE_FASTA_SUBDIR, basename[:5], basename)
 
 
+def _already_extracted(output_dir, archive_path):
+    """Return True if this archive's sample FASTA directory already exists and is non-empty."""
+    sample_dir = _sample_fasta_dir(output_dir, archive_path)
+    if not os.path.isdir(sample_dir):
+        return False
+    return any(f.endswith(".fasta") for f in os.listdir(sample_dir))
+
+
 def submit_extraction_jobs(
     archive_paths, marker_domains, markers_of_interest,
     output_dir, this_script_path
@@ -391,7 +399,7 @@ def submit_extraction_jobs(
             f" --segregated-log-files"
             f" --hours 4"
             f" --command-file {cmd_file_path}"
-            f" --chunk-size 200 2>&1"
+            f" --chunk-size 5000 2>&1"
         )
         logging.info(f"Running: {mqsub_cmd}")
         mqsub_stdout = extern.run(mqsub_cmd)
@@ -714,9 +722,13 @@ def collate_and_cluster(
         logging.warning("No metapackage provided — skipping off-target filtering.")
 
     if run_through_mqsub:
-        # Phase 1: submit one extraction job per archive
+        # Phase 1: submit one extraction job per archive (skip already-done ones)
+        pending = [p for p in archive_paths if not _already_extracted(output_dir, p)]
+        skipped = len(archive_paths) - len(pending)
+        if skipped:
+            logging.info(f"Skipping {skipped} already-extracted archive(s).")
         submit_extraction_jobs(
-            archive_paths, marker_domains, markers_of_interest,
+            pending, marker_domains, markers_of_interest,
             output_dir, this_script_path
         )
         # Phase 2: cat per-sample FASTAs into per-marker FASTAs (local, fast)
@@ -730,8 +742,12 @@ def collate_and_cluster(
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
+        pending = [p for p in archive_paths if not _already_extracted(output_dir, p)]
+        skipped = len(archive_paths) - len(pending)
+        if skipped:
+            logging.info(f"Skipping {skipped} already-extracted archive(s).")
         logging.info(
-            f"Extracting {len(archive_paths)} archive(s) locally "
+            f"Extracting {len(pending)} archive(s) locally "
             f"across {threads} thread(s) ..."
         )
         worker_args = [
@@ -741,7 +757,7 @@ def collate_and_cluster(
                 markers_of_interest,
                 _sample_fasta_dir(output_dir, archive_path),
             )
-            for archive_path in archive_paths
+            for archive_path in pending
         ]
         if threads > 1:
             with Pool(threads) as pool:
