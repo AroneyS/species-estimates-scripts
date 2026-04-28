@@ -698,6 +698,17 @@ def collate_and_cluster(
     if metapackage_path:
         logging.info("Loading metapackage for domain filtering ...")
         marker_domains = build_marker_domain_map(metapackage_path)
+        # Restrict to markers that target both Bacteria and Archaea
+        both_domains = {
+            m for m, domains in marker_domains.items()
+            if "Bacteria" in domains and "Archaea" in domains
+        }
+        logging.info(
+            f"{len(both_domains)} marker(s) target both Bacteria and Archaea."
+        )
+        markers_of_interest = (
+            markers_of_interest & both_domains if markers_of_interest else both_domains
+        )
     else:
         marker_domains = {}
         logging.warning("No metapackage provided — skipping off-target filtering.")
