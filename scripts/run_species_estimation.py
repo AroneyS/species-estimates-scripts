@@ -519,11 +519,12 @@ def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads
     else:
         results = list(map(_load_and_process, worker_args))
 
-    _write_cluster_results(results, marker_to_fasta, output_dir)
+    summary_rows = _write_cluster_results(results, marker_to_fasta, output_dir)
+    _write_summary(summary_rows, output_dir)
 
 
 def _write_cluster_results(results, marker_to_fasta, output_dir):
-    """Write cluster TSV, rep FASTA; write summary."""
+    """Write cluster TSV and rep FASTA; return summary rows (does not write summary.tsv)."""
     summary_rows = []
     for (marker_name, cluster_tsv, rep_fasta) in results:
         marker_dir = os.path.join(output_dir, marker_name)
@@ -546,6 +547,11 @@ def _write_cluster_results(results, marker_to_fasta, output_dir):
             "num_clusters": num_clusters,
         })
 
+    return summary_rows
+
+
+def _write_summary(summary_rows, output_dir):
+    """Write summary.tsv from a list of summary row dicts."""
     summary_path = os.path.join(output_dir, "summary.tsv")
     pd.DataFrame(summary_rows).sort_values("marker").to_csv(
         summary_path, sep="\t", index=False
@@ -597,6 +603,28 @@ def cluster_markers_via_mqsub(
 
     logging.info("All smafa cluster jobs finished.")
 
+    # Aggregate summary across all marker dirs (each worker only wrote its own
+    # cluster files; writing summary here ensures all markers are included).
+    fasta_dir = os.path.join(abs_output_dir, FASTA_SUBDIR)
+    summary_rows = []
+    for marker_name, fasta_path in marker_to_fasta.items():
+        marker_dir = os.path.join(abs_output_dir, marker_name)
+        clusters_path = os.path.join(marker_dir, "clusters.tsv")
+        num_clusters = 0
+        if os.path.exists(clusters_path):
+            with open(clusters_path) as fh:
+                num_clusters = sum(1 for ln in fh if ln.strip())
+        num_otus = 0
+        if os.path.exists(fasta_path):
+            with open(fasta_path) as fh:
+                num_otus = sum(1 for ln in fh if ln.startswith(">"))
+        summary_rows.append({
+            "marker": marker_name,
+            "num_otus": num_otus,
+            "num_clusters": num_clusters,
+        })
+    _write_summary(summary_rows, abs_output_dir)
+
 
 # ---------------------------------------------------------------------------
 # Shared mqsub wait helper
@@ -647,7 +675,7 @@ def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence):
         fasta_str = fh.read()
     result = process_marker((marker_name, fasta_str, max_divergence))
     _write_cluster_results([result], {marker_name: fasta_path}, output_dir)
-    logging.info(f"[{marker_name}] Cluster job complete.")
+    logging.info(f"[{marker_name}] Cluster job complete.")  # summary.tsv written by orchestrator
 
 
 # ---------------------------------------------------------------------------
