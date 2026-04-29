@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -448,35 +449,18 @@ def cat_sample_fastas(archive_paths, output_dir, markers_of_interest):
     )
     marker_to_fasta = {}
     for marker_name, sample_fastas in marker_to_sample_fastas.items():
-        # Read all records, sort globally, write collated file
-        records = []  # list of (sort_key_tuple, header, seq)
-        for sfasta in sample_fastas:
-            with open(sfasta) as fh:
-                header = None
-                seq_parts = []
-                for line in fh:
-                    line = line.rstrip()
-                    if line.startswith(">"):
-                        if header is not None:
-                            records.append((_header_sort_key(header), header, "".join(seq_parts)))
-                        header = line
-                        seq_parts = []
-                    else:
-                        seq_parts.append(line)
-                if header is not None:
-                    records.append((_header_sort_key(header), header, "".join(seq_parts)))
-
-        # Global sort: GlobDB-known first (encoded in header), then num_hits desc
-        records.sort(key=lambda r: r[0])
-
         collated_path = os.path.join(fasta_dir, f"{marker_name}.fasta")
-        with open(collated_path, "w") as fh:
-            for _, header, seq in records:
-                fh.write(header + "\n" + seq + "\n")
+        # Stream each per-sample FASTA directly into the collated file to
+        # avoid loading all sequences into memory at once.  Per-sample files
+        # are already locally sorted (known-first, num_hits desc), so the
+        # output preserves that ordering within each sample.
+        with open(collated_path, "w") as out_fh:
+            for sfasta in sample_fastas:
+                with open(sfasta) as in_fh:
+                    shutil.copyfileobj(in_fh, out_fh)
         marker_to_fasta[marker_name] = collated_path
         logging.debug(
-            f"[{marker_name}] Collated {len(records)} sequences from "
-            f"{len(sample_fastas)} sample(s)."
+            f"[{marker_name}] Collated {len(sample_fastas)} sample FASTA(s) into {collated_path}."
         )
 
     logging.info(f"Collation complete — {len(marker_to_fasta)} marker(s) ready for clustering.")
