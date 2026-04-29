@@ -18,6 +18,7 @@
 ###############################################################################
 
 import argparse
+import concurrent.futures
 import gzip
 import json
 import logging
@@ -412,7 +413,20 @@ def submit_extraction_jobs(
     logging.info("All extraction jobs finished.")
 
 
-def cat_sample_fastas(archive_paths, output_dir, markers_of_interest):
+def _cat_one_marker(args_tuple):
+    """Stream all per-sample FASTAs for one marker into the collated output file."""
+    marker_name, sample_fastas, collated_path = args_tuple
+    with open(collated_path, "w") as out_fh:
+        for sfasta in sample_fastas:
+            with open(sfasta) as in_fh:
+                shutil.copyfileobj(in_fh, out_fh)
+    logging.debug(
+        f"[{marker_name}] Collated {len(sample_fastas)} sample FASTA(s) into {collated_path}."
+    )
+    return marker_name, collated_path
+
+
+def cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads=1):
     """
     After per-sample extraction jobs have run, cat all per-sample per-marker
     FASTAs into one file per marker.  Also performs the global sort
@@ -445,23 +459,21 @@ def cat_sample_fastas(archive_paths, output_dir, markers_of_interest):
         return {}
 
     logging.info(
-        f"Concatenating sample FASTAs for {len(marker_to_sample_fastas)} marker(s) ..."
+        f"Concatenating sample FASTAs for {len(marker_to_sample_fastas)} marker(s) "
+        f"across {threads} thread(s) ..."
     )
+    worker_args = [
+        (marker_name, sample_fastas, os.path.join(fasta_dir, f"{marker_name}.fasta"))
+        for marker_name, sample_fastas in marker_to_sample_fastas.items()
+    ]
     marker_to_fasta = {}
-    for marker_name, sample_fastas in marker_to_sample_fastas.items():
-        collated_path = os.path.join(fasta_dir, f"{marker_name}.fasta")
-        # Stream each per-sample FASTA directly into the collated file to
-        # avoid loading all sequences into memory at once.  Per-sample files
-        # are already locally sorted (known-first, num_hits desc), so the
-        # output preserves that ordering within each sample.
-        with open(collated_path, "w") as out_fh:
-            for sfasta in sample_fastas:
-                with open(sfasta) as in_fh:
-                    shutil.copyfileobj(in_fh, out_fh)
-        marker_to_fasta[marker_name] = collated_path
-        logging.debug(
-            f"[{marker_name}] Collated {len(sample_fastas)} sample FASTA(s) into {collated_path}."
-        )
+    if threads > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            for marker_name, collated_path in executor.map(_cat_one_marker, worker_args):
+                marker_to_fasta[marker_name] = collated_path
+    else:
+        for marker_name, collated_path in map(_cat_one_marker, worker_args):
+            marker_to_fasta[marker_name] = collated_path
 
     logging.info(f"Collation complete — {len(marker_to_fasta)} marker(s) ready for clustering.")
     return marker_to_fasta
@@ -716,7 +728,7 @@ def collate_and_cluster(
             output_dir, this_script_path
         )
         # Phase 2: cat per-sample FASTAs into per-marker FASTAs (local, fast)
-        marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest)
+        marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads)
         if not marker_to_fasta:
             logging.warning("No markers with sequences — nothing to cluster.")
             return
@@ -749,7 +761,7 @@ def collate_and_cluster(
         else:
             list(map(extract_sample_fastas_local_worker, worker_args))
 
-        marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest)
+        marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads)
         if not marker_to_fasta:
             logging.warning("No markers with sequences — nothing to cluster.")
             return
