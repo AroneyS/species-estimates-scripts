@@ -352,6 +352,9 @@ def extract_sample_fastas(archive_path, marker_domains, markers_of_interest, sam
             fh.write(fasta_str)
         seen_markers.add(marker_name)
 
+    # Write sentinel so reruns can skip this archive even when it produced no FASTAs.
+    open(os.path.join(sample_fasta_dir, ".done"), "w").close()
+
     return seen_markers
 
 
@@ -386,11 +389,9 @@ def _sample_fasta_dir(output_dir, archive_path):
 
 
 def _already_extracted(output_dir, archive_path):
-    """Return True if this archive's sample FASTA directory already exists and is non-empty."""
+    """Return True if extraction has been completed for this archive (done sentinel exists)."""
     sample_dir = _sample_fasta_dir(output_dir, archive_path)
-    if not os.path.isdir(sample_dir):
-        return False
-    return any(f.endswith(".fasta") for f in os.listdir(sample_dir))
+    return os.path.exists(os.path.join(sample_dir, ".done"))
 
 
 def submit_extraction_jobs(
