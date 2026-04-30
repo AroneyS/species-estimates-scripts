@@ -397,7 +397,7 @@ def submit_extraction_jobs(
 
     try:
         mqsub_cmd = (
-            f"mqsub_aqua -m 4 --name otu_extract"
+            f"mqsub -m 4 --name otu_extract"
             f" --segregated-log-files"
             f" --hours 4"
             f" --command-file {cmd_file_path}"
@@ -567,49 +567,76 @@ def _write_summary(summary_rows, output_dir):
 # Phase 3 (mqsub): submit one smafa cluster job per marker
 # ---------------------------------------------------------------------------
 
+def _already_clustered(output_dir, marker_name):
+    """Return True if this marker's clusters.tsv already exists and is non-empty."""
+    clusters_path = os.path.join(output_dir, marker_name, "clusters.tsv")
+    return os.path.exists(clusters_path) and os.path.getsize(clusters_path) > 0
+
+
 def cluster_markers_via_mqsub(
-    marker_to_fasta, output_dir, max_divergence, this_script_path
+    marker_to_fasta, output_dir, max_divergence, this_script_path, cluster_memory=64
 ):
     """Submit one mqsub job per marker for smafa cluster."""
-    logging.info(
-        f"Submitting {len(marker_to_fasta)} smafa cluster job(s) via mqsub ..."
-    )
     abs_output_dir = os.path.abspath(output_dir)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", prefix="smafa_cluster_mqsub_", suffix=".cmds", delete=False
-    ) as cmd_file:
-        cmd_file_path = cmd_file.name
-        for marker_name, fasta_path in marker_to_fasta.items():
-            cmd = (
-                f"python3 {this_script_path}"
-                f" --_cluster-marker-fasta {os.path.abspath(fasta_path)}"
-                f" --_marker-name {marker_name}"
-                f" --output-directory {abs_output_dir}"
-                f" --max-divergence {max_divergence}"
-            )
-            cmd_file.write(cmd + "\n")
-
-    try:
-        mqsub_cmd = (
-            f"mqsub_aqua -m 4 --name smafa_cluster"
-            f" --segregated-log-files"
-            f" --hours 12"
-            f" --command-file {cmd_file_path}"
-            f" --chunk-size 1 2>&1"
+    # Skip markers already clustered successfully
+    pending = {
+        m: p for m, p in marker_to_fasta.items()
+        if not _already_clustered(abs_output_dir, m)
+    }
+    skipped = len(marker_to_fasta) - len(pending)
+    if skipped:
+        logging.info(f"Skipping {skipped} already-clustered marker(s).")
+    if not pending:
+        logging.info("All markers already clustered.")
+    else:
+        logging.info(
+            f"Submitting {len(pending)} smafa cluster job(s) via mqsub ..."
         )
-        logging.info(f"Running: {mqsub_cmd}")
-        mqsub_stdout = extern.run(mqsub_cmd)
-        logging.info(f"Submitted {len(marker_to_fasta)} mqsub job(s).")
-        _mqwait(mqsub_stdout)
-    finally:
-        os.unlink(cmd_file_path)
+        with tempfile.NamedTemporaryFile(
+            mode="w", prefix="smafa_cluster_mqsub_", suffix=".cmds", delete=False
+        ) as cmd_file:
+            cmd_file_path = cmd_file.name
+            for marker_name, fasta_path in pending.items():
+                cmd = (
+                    f"python3 {this_script_path}"
+                    f" --_cluster-marker-fasta {os.path.abspath(fasta_path)}"
+                    f" --_marker-name {marker_name}"
+                    f" --output-directory {abs_output_dir}"
+                    f" --max-divergence {max_divergence}"
+                )
+                cmd_file.write(cmd + "\n")
 
-    logging.info("All smafa cluster jobs finished.")
+        try:
+            mqsub_cmd = (
+                f"mqsub -m {cluster_memory} --name smafa_cluster"
+                f" --segregated-log-files"
+                f" --hours 12"
+                f" --command-file {cmd_file_path}"
+                f" --chunk-size 1 2>&1"
+            )
+            logging.info(f"Running: {mqsub_cmd}")
+            mqsub_stdout = extern.run(mqsub_cmd)
+            logging.info(f"Submitted {len(pending)} mqsub job(s).")
+            _mqwait(mqsub_stdout)
+        finally:
+            os.unlink(cmd_file_path)
+
+        logging.info("All smafa cluster jobs finished.")
+
+        # Check for failures: any pending marker missing its clusters.tsv
+        failed = [
+            m for m in pending
+            if not _already_clustered(abs_output_dir, m)
+        ]
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} smafa cluster job(s) failed (no output produced):\n"
+                + "\n".join(f"  {m}" for m in sorted(failed))
+            )
 
     # Aggregate summary across all marker dirs (each worker only wrote its own
     # cluster files; writing summary here ensures all markers are included).
-    fasta_dir = os.path.join(abs_output_dir, FASTA_SUBDIR)
     summary_rows = []
     for marker_name, fasta_path in marker_to_fasta.items():
         marker_dir = os.path.join(abs_output_dir, marker_name)
@@ -695,6 +722,7 @@ def collate_and_cluster(
     markers_of_interest,
     run_through_mqsub,
     this_script_path,
+    cluster_memory=64,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -734,7 +762,8 @@ def collate_and_cluster(
             return
         # Phase 3: submit one smafa cluster job per marker
         cluster_markers_via_mqsub(
-            marker_to_fasta, output_dir, max_divergence, this_script_path
+            marker_to_fasta, output_dir, max_divergence, this_script_path,
+            cluster_memory=cluster_memory,
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
@@ -844,6 +873,13 @@ if __name__ == "__main__":
             "Phase 1 (collation) still runs locally; one job is submitted per marker."
         ),
     )
+    parser.add_argument(
+        "--cluster-memory",
+        type=int,
+        default=64,
+        metavar="GB",
+        help="Memory (GB) to request for each smafa cluster mqsub job (default: 64)",
+    )
 
     # --- Internal: used only when this script is re-invoked by an mqsub worker ---
     parser.add_argument("--_cluster-marker-fasta", metavar="FILE", help=argparse.SUPPRESS)
@@ -915,4 +951,5 @@ if __name__ == "__main__":
         markers_of_interest=set(args.markers) if args.markers else None,
         run_through_mqsub=args.run_through_mqsub,
         this_script_path=_this_script,
+        cluster_memory=args.cluster_memory,
     )
