@@ -133,13 +133,11 @@ def is_on_target(otu, marker_domains):
 
 def sort_key(otu):
     """
-    Sort so that GlobDB-known OTUs come first, then by num_hits descending.
+    Sort so that query-assigned OTUs come first, then by num_hits descending.
 
-    'taxonomy_by_known?' == True  →  GlobDB/known taxonomy (lower sort value = first).
+    'taxonomy_assignment_method' == 'singlem_query_based'  →  known (lower sort value = first).
     """
-    known = otu.get("taxonomy_by_known?", False)
-    # True → 0 (first), False → 1 (second)
-    known_rank = 0 if known is True or known == "True" or known == "true" else 1
+    known_rank = 0 if otu.get("taxonomy_assignment_method") == "singlem_query_based" else 1
     hits = otu.get("num_hits", 0)
     try:
         hits = int(hits)
@@ -155,119 +153,160 @@ def otus_to_fasta(otus):
     Sort fields are embedded in the header so that after per-sample FASTAs are
     cat'd together the global sort can be reconstructed without re-reading the
     original archive.  Format:
-        >otu{i}|{sample}|{gene}|known={0or1}|hits={n}
+        >otu{i}|{sample}|{gene}|unknown={0or1}|hits={n}
+
+    unknown=0: taxonomy_assignment_method is singlem_query_based; unknown=1: everything else.
     """
     lines = []
     for i, otu in enumerate(otus):
         seq = otu.get("sequence", "")
         if not seq or seq == "-":
             continue
-        known = otu.get("taxonomy_by_known?", False)
-        known_rank = 0 if known is True or known in ("True", "true") else 1
+        known_rank = 0 if otu.get("taxonomy_assignment_method") == "singlem_query_based" else 1
         hits = 0
         try:
             hits = int(otu.get("num_hits", 0))
         except (TypeError, ValueError):
             pass
-        header = f">otu{i}|{otu['sample']}|{otu['gene']}|known={known_rank}|hits={hits}"
+        header = f">otu{i}|{otu['sample']}|{otu['gene']}|unknown={known_rank}|hits={hits}"
         lines.append(header)
         lines.append(seq)
     return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# smafa wrappers
+# smafa wrappers and clustering helpers
 # ---------------------------------------------------------------------------
 
-def run_smafa_cluster(fasta_str, max_divergence, marker_name):
-    """
-    Run smafa cluster on fasta_str (passed via a temp file).
-    Returns the stdout string (clusters TSV).
-    """
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".fasta", prefix=f"smafa_cluster_{marker_name}_", delete=False
-    ) as fasta_f:
-        fasta_f.write(fasta_str)
-        fasta_path = fasta_f.name
-
+def _parse_header_stats(header):
+    """Extract (unknown_rank, hits) from a FASTA header written by otus_to_fasta."""
     try:
-        cmd = [
-            "smafa",
-            "cluster",
-            "--max-divergence",
-            str(max_divergence),
-            "--input",
-            fasta_path,
-        ]
-        logging.debug(f"[{marker_name}] Running: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
+        parts = header.lstrip(">").split("|")
+        unknown_rank = int(next((p.split("=")[1] for p in parts if p.startswith("unknown=")), "1"))
+        hits = int(next((p.split("=")[1] for p in parts if p.startswith("hits=")), "0"))
+    except (ValueError, IndexError):
+        unknown_rank, hits = 1, 0
+    return unknown_rank, hits
+
+
+def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name):
+    """
+    Run smafa cluster directly on fasta_path, writing output to a sibling temp file.
+    Returns the path to the cluster TSV file (caller is responsible for deletion).
+    """
+    cluster_tmp = fasta_path + ".smafa_clusters.tsv"
+    cmd = [
+        "smafa", "cluster",
+        "--max-divergence", str(max_divergence),
+        "--input", fasta_path,
+    ]
+    logging.debug(f"[{marker_name}] Running: {' '.join(cmd)}")
+    with open(cluster_tmp, "w") as out_fh:
+        result = subprocess.run(cmd, stdout=out_fh, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        if os.path.exists(cluster_tmp):
+            os.unlink(cluster_tmp)
+        raise RuntimeError(
+            f"smafa cluster failed for marker {marker_name}:\n{result.stderr}"
         )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"smafa cluster failed for marker {marker_name}:\n{result.stderr}"
-            )
-        return result.stdout
-    finally:
-        os.unlink(fasta_path)
+    return cluster_tmp
 
 
-# ---------------------------------------------------------------------------
-# Per-marker worker (called via multiprocessing.Pool or mqsub)
-# ---------------------------------------------------------------------------
-
-def process_marker(args_tuple):
+def _process_cluster_file(fasta_path, cluster_path, marker_name):
     """
-    Worker function for one marker.
+    Build the enriched representative FASTA and return (cluster_tsv_str, rep_fasta_str)
+    using three streaming passes.
 
-    args_tuple: (marker_name, fasta_str, max_divergence)
-
-    Returns (marker_name, cluster_tsv, rep_fasta).
+    Pass 1 (cluster file):  collect rep_seqs set  (O(n_clusters) memory).
+    Pass 2 (FASTA):         build rep_to_header   (O(n_clusters) — reps only)
+                            build seq_to_stats    (O(n_unique_seqs) × 2 ints — no header strings).
+    Pass 3 (cluster file):  aggregate per-cluster stats using seq_to_stats.
     """
-    (marker_name, fasta_str, max_divergence) = args_tuple
+    # Pass 1: get the set of representative sequences.
+    rep_seqs = set()
+    with open(cluster_path) as cf:
+        for line in cf:
+            line = line.rstrip("\n")
+            if line:
+                parts = line.split("\t")
+                if parts:
+                    rep_seqs.add(parts[0].lstrip(">"))
 
-    if not fasta_str or not fasta_str.strip():
-        logging.warning(f"[{marker_name}] Empty FASTA — skipping.")
-        return (marker_name, "", None, "")
-
-    num_seqs = fasta_str.count(">")
-    logging.info(f"[{marker_name}] Clustering {num_seqs} OTU(s) ...")
-    cluster_tsv = run_smafa_cluster(fasta_str, max_divergence, marker_name)
-
-    # Extract representative IDs from cluster output (rep_id \t member_id).
-    rep_ids = set()
-    for line in cluster_tsv.splitlines():
-        parts = line.split("\t")
-        if parts:
-            rep_ids.add(parts[0].lstrip(">"))
-
-    # Re-extract rep sequences from the input FASTA.
-    rep_fasta_lines = []
+    # Pass 2: stream the FASTA once.
+    #   - seq_to_stats: seq -> (unknown_rank, hits)  for every unique sequence
+    #     (values are two ints, not header strings)
+    #   - rep_to_header: seq -> header  only for sequences that are cluster reps
+    seq_to_stats = {}   # seq -> (unknown_rank, hits)
+    rep_to_header = {}  # seq -> original header line (reps only)
     current_header = None
     current_seq_parts = []
-    for line in fasta_str.splitlines():
-        if line.startswith(">"):
-            if current_header is not None:
-                seq_id = current_header.lstrip(">")
-                if seq_id in rep_ids:
-                    rep_fasta_lines.append(current_header)
-                    rep_fasta_lines.append("".join(current_seq_parts))
-            current_header = line
-            current_seq_parts = []
-        else:
-            current_seq_parts.append(line)
-    # flush last record
-    if current_header is not None:
-        seq_id = current_header.lstrip(">")
-        if seq_id in rep_ids:
-            rep_fasta_lines.append(current_header)
-            rep_fasta_lines.append("".join(current_seq_parts))
-    rep_fasta = "\n".join(rep_fasta_lines) + "\n"
 
-    logging.info(f"[{marker_name}] Done — {len(rep_ids)} cluster(s) from {num_seqs} OTU(s).")
-    return (marker_name, cluster_tsv, rep_fasta)
+    def _fasta_flush(hdr, seq_parts):
+        seq = "".join(seq_parts)
+        if not seq:
+            return
+        if seq not in seq_to_stats:
+            seq_to_stats[seq] = _parse_header_stats(hdr)
+        if seq in rep_seqs and seq not in rep_to_header:
+            rep_to_header[seq] = hdr
+
+    with open(fasta_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if current_header is not None:
+                    _fasta_flush(current_header, current_seq_parts)
+                current_header = line
+                current_seq_parts = []
+            else:
+                current_seq_parts.append(line)
+    if current_header is not None:
+        _fasta_flush(current_header, current_seq_parts)
+
+    # Pass 3: stream the cluster file to aggregate per-cluster stats.
+    rep_stats = {}  # rep_seq -> {n_seqs, n_query, max_hits, total_hits}
+    with open(cluster_path) as cf:
+        for line in cf:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            rep_seq = parts[0].lstrip(">")
+            member_seq = parts[1].lstrip(">")
+            if rep_seq not in rep_stats:
+                rep_stats[rep_seq] = {"n_seqs": 0, "n_query": 0, "max_hits": 0, "total_hits": 0}
+            s = rep_stats[rep_seq]
+            s["n_seqs"] += 1
+            unk, hits = seq_to_stats.get(member_seq, (1, 0))
+            s["n_query"] += 1 if unk == 0 else 0
+            s["max_hits"] = max(s["max_hits"], hits)
+            s["total_hits"] += hits
+
+    # Build enriched rep FASTA.
+    rep_fasta_lines = []
+    for rep_seq, stats in rep_stats.items():
+        orig_header = rep_to_header.get(rep_seq)
+        if orig_header is None:
+            logging.warning(f"[{marker_name}] Rep sequence not found in FASTA — skipping.")
+            continue
+        enriched_header = (
+            f"{orig_header}"
+            f"|cluster_size={stats['n_seqs']}"
+            f"|n_query={stats['n_query']}"
+            f"|max_hits={stats['max_hits']}"
+            f"|total_hits={stats['total_hits']}"
+        )
+        rep_fasta_lines.append(enriched_header)
+        rep_fasta_lines.append(rep_seq)
+    rep_fasta = "\n".join(rep_fasta_lines) + "\n" if rep_fasta_lines else ""
+
+    # Read cluster TSV so callers can write it to disk.
+    with open(cluster_path) as cf:
+        cluster_tsv = cf.read()
+
+    return cluster_tsv, rep_fasta
 
 
 # ---------------------------------------------------------------------------
@@ -482,14 +521,14 @@ def cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads=1)
 def _header_sort_key(header):
     """
     Reconstruct a sort key from the FASTA header written by otus_to_fasta.
-    Header format: >otu{i}|{sample}|{gene}|known={0or1}|hits={n}
+    Header format: >otu{i}|{sample}|{gene}|unknown={0or1}|hits={n}
     Falls back gracefully if fields are missing.
     """
     # We embed sort fields in the header so we can recover them post-cat.
     # See otus_to_fasta() — the enriched format is set there.
     try:
         parts = header.lstrip(">").split("|")
-        known_rank = int(next((p.split("=")[1] for p in parts if p.startswith("known=")), "1"))
+        known_rank = int(next((p.split("=")[1] for p in parts if p.startswith("unknown=")), "1"))
         hits = int(next((p.split("=")[1] for p in parts if p.startswith("hits=")), "0"))
         return (known_rank, -hits)
     except (ValueError, IndexError):
@@ -501,13 +540,23 @@ def _header_sort_key(header):
 # ---------------------------------------------------------------------------
 
 def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads):
-    """Run smafa cluster for each marker in parallel."""
+    """Run smafa cluster for each marker in parallel (file-based, no fasta_str)."""
 
-    def _load_and_process(args_tuple):
+    def _cluster_one(args_tuple):
         (marker_name, fasta_path, max_divergence) = args_tuple
-        with open(fasta_path) as fh:
-            fasta_str = fh.read()
-        return process_marker((marker_name, fasta_str, max_divergence))
+        num_seqs = sum(1 for ln in open(fasta_path) if ln.startswith(">"))
+        logging.info(f"[{marker_name}] Clustering {num_seqs} OTU(s) ...")
+        cluster_tmp = _run_smafa_cluster_file(fasta_path, max_divergence, marker_name)
+        try:
+            cluster_tsv, rep_fasta = _process_cluster_file(fasta_path, cluster_tmp, marker_name)
+        finally:
+            if os.path.exists(cluster_tmp):
+                os.unlink(cluster_tmp)
+        n_clusters = len(set(
+            ln.split("\t")[0] for ln in cluster_tsv.splitlines() if ln.strip()
+        ))
+        logging.info(f"[{marker_name}] Done — {n_clusters} cluster(s) from {num_seqs} OTU(s).")
+        return (marker_name, cluster_tsv, rep_fasta)
 
     worker_args = [
         (marker, path, max_divergence)
@@ -519,9 +568,9 @@ def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads
     )
     if threads > 1:
         with Pool(threads) as pool:
-            results = pool.map(_load_and_process, worker_args)
+            results = pool.map(_cluster_one, worker_args)
     else:
-        results = list(map(_load_and_process, worker_args))
+        results = list(map(_cluster_one, worker_args))
 
     summary_rows = _write_cluster_results(results, marker_to_fasta, output_dir)
     _write_summary(summary_rows, output_dir)
@@ -701,11 +750,24 @@ def worker_extract_sample(archive_path, marker_domains_tsv, sample_fasta_dir, ma
 
 
 def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence):
-    """Entry point for per-marker smafa cluster mqsub jobs."""
-    with open(fasta_path) as fh:
-        fasta_str = fh.read()
-    result = process_marker((marker_name, fasta_str, max_divergence))
+    """Entry point for per-marker smafa cluster mqsub jobs (file-based, no fasta_str)."""
+    if not os.path.exists(fasta_path) or os.path.getsize(fasta_path) == 0:
+        logging.warning(f"[{marker_name}] Empty or missing FASTA — skipping.")
+        return
+    num_seqs = sum(1 for ln in open(fasta_path) if ln.startswith(">"))
+    logging.info(f"[{marker_name}] Clustering {num_seqs} OTU(s) ...")
+    cluster_tmp = _run_smafa_cluster_file(fasta_path, max_divergence, marker_name)
+    try:
+        cluster_tsv, rep_fasta = _process_cluster_file(fasta_path, cluster_tmp, marker_name)
+    finally:
+        if os.path.exists(cluster_tmp):
+            os.unlink(cluster_tmp)
+    result = (marker_name, cluster_tsv, rep_fasta)
     _write_cluster_results([result], {marker_name: fasta_path}, output_dir)
+    n_clusters = len(set(
+        ln.split("\t")[0] for ln in cluster_tsv.splitlines() if ln.strip()
+    ))
+    logging.info(f"[{marker_name}] Done — {n_clusters} cluster(s) from {num_seqs} OTU(s).")
     logging.info(f"[{marker_name}] Cluster job complete.")  # summary.tsv written by orchestrator
 
 
