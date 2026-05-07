@@ -189,15 +189,17 @@ def _parse_header_stats(header):
     return unknown_rank, hits
 
 
-def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name):
+def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=1):
     """
     Run smafa cluster directly on fasta_path, writing output to a sibling temp file.
     Returns the path to the cluster TSV file (caller is responsible for deletion).
     """
     cluster_tmp = fasta_path + ".smafa_clusters.tsv"
     cmd = [
-        "smafa", "cluster",
+        "cargo", "run", "--manifest-path", "/home/aroneys/src/smafa/Cargo.toml", "--", "cluster",
+        # "smafa", "cluster",
         "--max-divergence", str(max_divergence),
+        "--threads", str(threads),
         "--input", fasta_path,
     ]
     logging.debug(f"[{marker_name}] Running: {' '.join(cmd)}")
@@ -624,7 +626,8 @@ def _already_clustered(output_dir, marker_name):
 
 
 def cluster_markers_via_mqsub(
-    marker_to_fasta, output_dir, max_divergence, this_script_path, cluster_memory=64
+    marker_to_fasta, output_dir, max_divergence, this_script_path, cluster_memory=64,
+    cluster_threads=32,
 ):
     """Submit one mqsub job per marker for smafa cluster."""
     abs_output_dir = os.path.abspath(output_dir)
@@ -654,12 +657,13 @@ def cluster_markers_via_mqsub(
                     f" --_marker-name {marker_name}"
                     f" --output-directory {abs_output_dir}"
                     f" --max-divergence {max_divergence}"
+                    f" --_cluster-threads {cluster_threads}"
                 )
                 cmd_file.write(cmd + "\n")
 
         try:
             mqsub_cmd = (
-                f"mqsub -m {cluster_memory} --name smafa_cluster"
+                f"mqsub -m {cluster_memory} -t {cluster_threads} --name smafa_cluster"
                 f" --segregated-log-files"
                 f" --hours 12"
                 f" --command-file {cmd_file_path}"
@@ -750,14 +754,14 @@ def worker_extract_sample(archive_path, marker_domains_tsv, sample_fasta_dir, ma
     logging.info(f"Extracted {len(seen)} marker(s) from {archive_path}")
 
 
-def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence):
+def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence, threads=1):
     """Entry point for per-marker smafa cluster mqsub jobs (file-based, no fasta_str)."""
     if not os.path.exists(fasta_path) or os.path.getsize(fasta_path) == 0:
         logging.warning(f"[{marker_name}] Empty or missing FASTA — skipping.")
         return
     num_seqs = sum(1 for ln in open(fasta_path) if ln.startswith(">"))
     logging.info(f"[{marker_name}] Clustering {num_seqs} OTU(s) ...")
-    cluster_tmp = _run_smafa_cluster_file(fasta_path, max_divergence, marker_name)
+    cluster_tmp = _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=threads)
     try:
         cluster_tsv, rep_fasta = _process_cluster_file(fasta_path, cluster_tmp, marker_name)
     finally:
@@ -786,6 +790,7 @@ def collate_and_cluster(
     run_through_mqsub,
     this_script_path,
     cluster_memory=64,
+    cluster_threads=32,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -827,6 +832,7 @@ def collate_and_cluster(
         cluster_markers_via_mqsub(
             marker_to_fasta, output_dir, max_divergence, this_script_path,
             cluster_memory=cluster_memory,
+            cluster_threads=cluster_threads,
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
@@ -944,9 +950,18 @@ if __name__ == "__main__":
         help="Memory (GB) to request for each smafa cluster mqsub job (default: 64)",
     )
 
+    parser.add_argument(
+        "--cluster-threads",
+        type=int,
+        default=32,
+        metavar="N",
+        help="Threads per smafa cluster mqsub job (default: 32)",
+    )
+
     # --- Internal: used only when this script is re-invoked by an mqsub worker ---
     parser.add_argument("--_cluster-marker-fasta", metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--_marker-name", metavar="NAME", help=argparse.SUPPRESS)
+    parser.add_argument("--_cluster-threads", type=int, default=16, help=argparse.SUPPRESS)
     # Per-sample extraction worker args
     parser.add_argument("--_extract-sample-archive", metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--_marker-domains-tsv", metavar="FILE", help=argparse.SUPPRESS)
@@ -990,6 +1005,7 @@ if __name__ == "__main__":
             marker_name=args._marker_name,
             output_dir=args.output_directory,
             max_divergence=args.max_divergence,
+            threads=args._cluster_threads,
         )
         sys.exit(0)
 
@@ -1015,4 +1031,5 @@ if __name__ == "__main__":
         run_through_mqsub=args.run_through_mqsub,
         this_script_path=_this_script,
         cluster_memory=args.cluster_memory,
+        cluster_threads=args.cluster_threads,
     )
