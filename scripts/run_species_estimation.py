@@ -214,6 +214,167 @@ def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=1):
     return cluster_tmp
 
 
+def _read_fasta_sequences(fasta_path):
+    """
+    Read a FASTA file and return (sequences, seq_to_header, seq_to_stats).
+      sequences:     [(header, seq), ...]  in input order
+      seq_to_header: seq -> first header seen
+      seq_to_stats:  seq -> (unknown_rank, hits)
+    """
+    sequences = []
+    seq_to_header = {}
+    seq_to_stats = {}
+    with open(fasta_path) as fh:
+        current_header = None
+        seq_parts = []
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if current_header is not None and seq_parts:
+                    seq = "".join(seq_parts)
+                    sequences.append((current_header, seq))
+                    seq_to_header.setdefault(seq, current_header)
+                    seq_to_stats.setdefault(seq, _parse_header_stats(current_header))
+                current_header = line
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+        if current_header is not None and seq_parts:
+            seq = "".join(seq_parts)
+            sequences.append((current_header, seq))
+            seq_to_header.setdefault(seq, current_header)
+            seq_to_stats.setdefault(seq, _parse_header_stats(current_header))
+    return sequences, seq_to_header, seq_to_stats
+
+
+def _propagate_chunk_results(rep_to_all_members, chunk_clusters_path):
+    """
+    Read a smafa clusters TSV (member\tcentroid) and propagate accumulated
+    cluster membership from previous rounds.
+
+    Returns the updated rep_to_all_members dict.
+    """
+    chunk_rep_to_members = defaultdict(list)
+    with open(chunk_clusters_path) as cf:
+        for line in cf:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            member_seq = parts[0]   # col 1 = sequence being assigned
+            true_rep   = parts[1]   # col 2 = centroid
+            chunk_rep_to_members[true_rep].append(member_seq)
+
+    new_rep_to_all_members = {}
+    for new_rep, chunk_members in chunk_rep_to_members.items():
+        all_members = []
+        for member in chunk_members:
+            if member in rep_to_all_members:
+                all_members.extend(rep_to_all_members[member])
+            else:
+                all_members.append(member)
+        new_rep_to_all_members[new_rep] = all_members
+    return new_rep_to_all_members
+
+
+def _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, marker_name):
+    """
+    Build cluster_tsv and enriched rep_fasta from accumulated cluster state.
+    Returns (cluster_tsv_str, rep_fasta_str).
+    """
+    cluster_tsv_lines = []
+    for rep_seq, members in rep_to_all_members.items():
+        for member in members:
+            cluster_tsv_lines.append(f"{member}\t{rep_seq}")
+    cluster_tsv = "\n".join(cluster_tsv_lines) + "\n" if cluster_tsv_lines else ""
+
+    rep_fasta_lines = []
+    for rep_seq, members in rep_to_all_members.items():
+        n_seqs = len(members)
+        n_query = sum(1 for m in members if seq_to_stats.get(m, (1, 0))[0] == 0)
+        max_hits = max((seq_to_stats.get(m, (1, 0))[1] for m in members), default=0)
+        total_hits = sum(seq_to_stats.get(m, (1, 0))[1] for m in members)
+        orig_header = seq_to_header.get(rep_seq)
+        if orig_header is None:
+            logging.warning(f"[{marker_name}] Rep sequence not found in FASTA — skipping.")
+            continue
+        enriched_header = (
+            f"{orig_header}"
+            f"|cluster_size={n_seqs}"
+            f"|n_query={n_query}"
+            f"|max_hits={max_hits}"
+            f"|total_hits={total_hits}"
+        )
+        rep_fasta_lines.append(enriched_header)
+        rep_fasta_lines.append(rep_seq)
+    rep_fasta = "\n".join(rep_fasta_lines) + "\n" if rep_fasta_lines else ""
+    return cluster_tsv, rep_fasta
+
+
+def _cluster_marker_file_chunked(fasta_path, max_divergence, marker_name, chunk_size=10000, threads=16):
+    """
+    Cluster sequences in sequential greedy chunks (local path, no mqsub).
+
+    Processes sequences in batches of `chunk_size`.  Each round runs smafa on
+    (current_reps + next_chunk).  Member lists are propagated so the final
+    cluster_tsv maps every original sequence to its final representative.
+
+    Returns (cluster_tsv_str, rep_fasta_str).
+    """
+    sequences, seq_to_header, seq_to_stats = _read_fasta_sequences(fasta_path)
+    n_total = len(sequences)
+    if n_total == 0:
+        return "", ""
+
+    chunks = [sequences[i:i + chunk_size] for i in range(0, n_total, chunk_size)]
+    logging.info(
+        f"[{marker_name}] Chunked clustering: {n_total} sequence(s) "
+        f"in {len(chunks)} chunk(s) of up to {chunk_size}."
+    )
+
+    rep_to_all_members = {}
+    current_rep_seqs = []
+
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk_seqs = [seq for _, seq in chunk]
+        combined_seqs = current_rep_seqs + chunk_seqs
+
+        tmp_fasta_path = None
+        cluster_tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".fasta", delete=False,
+                prefix=f"smafa_chunk{chunk_idx}_",
+            ) as tmp_fasta:
+                for seq in combined_seqs:
+                    tmp_fasta.write(seq_to_header[seq] + "\n" + seq + "\n")
+                tmp_fasta_path = tmp_fasta.name
+
+            logging.info(
+                f"[{marker_name}] Chunk {chunk_idx + 1}/{len(chunks)}: "
+                f"{len(current_rep_seqs)} rep(s) + {len(chunk_seqs)} new = "
+                f"{len(combined_seqs)} sequence(s)."
+            )
+            cluster_tmp = _run_smafa_cluster_file(
+                tmp_fasta_path, max_divergence, marker_name, threads=threads
+            )
+            rep_to_all_members = _propagate_chunk_results(rep_to_all_members, cluster_tmp)
+        finally:
+            if tmp_fasta_path and os.path.exists(tmp_fasta_path):
+                os.unlink(tmp_fasta_path)
+            if cluster_tmp and os.path.exists(cluster_tmp):
+                os.unlink(cluster_tmp)
+
+        current_rep_seqs = list(rep_to_all_members.keys())
+        logging.info(
+            f"[{marker_name}] After chunk {chunk_idx + 1}: {len(current_rep_seqs)} cluster(s)."
+        )
+
+    return _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, marker_name)
+
+
 def _process_cluster_file(fasta_path, cluster_path, marker_name):
     """
     Build the enriched representative FASTA and return (cluster_tsv_str, rep_fasta_str)
@@ -225,14 +386,15 @@ def _process_cluster_file(fasta_path, cluster_path, marker_name):
     Pass 3 (cluster file):  aggregate per-cluster stats using seq_to_stats.
     """
     # Pass 1: get the set of representative sequences.
+    # smafa writes  sequence\tcentroid  so col 2 is the centroid/rep.
     rep_seqs = set()
     with open(cluster_path) as cf:
         for line in cf:
             line = line.rstrip("\n")
             if line:
                 parts = line.split("\t")
-                if parts:
-                    rep_seqs.add(parts[0].lstrip(">"))
+                if len(parts) >= 2:
+                    rep_seqs.add(parts[1])
 
     # Pass 2: stream the FASTA once.
     #   - seq_to_stats: seq -> (unknown_rank, hits)  for every unique sequence
@@ -275,8 +437,8 @@ def _process_cluster_file(fasta_path, cluster_path, marker_name):
             parts = line.split("\t")
             if len(parts) < 2:
                 continue
-            rep_seq = parts[0].lstrip(">")
-            member_seq = parts[1].lstrip(">")
+            rep_seq = parts[1]           # col 2 = centroid/rep
+            member_seq = parts[0]         # col 1 = sequence being assigned
             if rep_seq not in rep_stats:
                 rep_stats[rep_seq] = {"n_seqs": 0, "n_query": 0, "max_hits": 0, "total_hits": 0}
             s = rep_stats[rep_seq]
@@ -471,16 +633,30 @@ def _cat_one_marker(args_tuple):
 def cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads=1):
     """
     After per-sample extraction jobs have run, cat all per-sample per-marker
-    FASTAs into one file per marker.  Also performs the global sort
-    (GlobDB-known first, then num_hits desc) by re-reading sequence headers.
+    FASTAs into one file per marker.
+
+    If a collated FASTA already exists for a marker it is reused as-is.
 
     Returns a dict: marker_name -> collated_fasta_path.
     """
     fasta_dir = os.path.join(output_dir, FASTA_SUBDIR)
     os.makedirs(fasta_dir, exist_ok=True)
 
-    # Discover which markers exist across all samples
-    sample_root = os.path.join(output_dir, SAMPLE_FASTA_SUBDIR)
+    # If all markers of interest already have collated FASTAs, skip scanning entirely.
+    if markers_of_interest:
+        existing = {
+            m: os.path.join(fasta_dir, f"{m}.fasta")
+            for m in markers_of_interest
+            if os.path.exists(os.path.join(fasta_dir, f"{m}.fasta"))
+               and os.path.getsize(os.path.join(fasta_dir, f"{m}.fasta")) > 0
+        }
+        if len(existing) == len(markers_of_interest):
+            logging.info(
+                f"All {len(existing)} collated FASTA(s) already exist — skipping concatenation."
+            )
+            return existing
+
+    # Discover which markers need (re-)collation.
     marker_to_sample_fastas = defaultdict(list)
     for archive_path in archive_paths:
         sample_dir = _sample_fasta_dir(output_dir, archive_path)
@@ -500,24 +676,34 @@ def cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads=1)
         logging.warning("No per-sample FASTA files found after extraction jobs.")
         return {}
 
-    logging.info(
-        f"Concatenating sample FASTAs for {len(marker_to_sample_fastas)} marker(s) "
-        f"across {threads} thread(s) ..."
-    )
-    worker_args = [
-        (marker_name, sample_fastas, os.path.join(fasta_dir, f"{marker_name}.fasta"))
-        for marker_name, sample_fastas in marker_to_sample_fastas.items()
-    ]
+    # Skip markers whose collated FASTA already exists.
     marker_to_fasta = {}
-    if threads > 1:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-            for marker_name, collated_path in executor.map(_cat_one_marker, worker_args):
-                marker_to_fasta[marker_name] = collated_path
-    else:
-        for marker_name, collated_path in map(_cat_one_marker, worker_args):
+    pending_args = []
+    for marker_name, sample_fastas in marker_to_sample_fastas.items():
+        collated_path = os.path.join(fasta_dir, f"{marker_name}.fasta")
+        if os.path.exists(collated_path) and os.path.getsize(collated_path) > 0:
+            logging.debug(f"[{marker_name}] Collated FASTA already exists — skipping.")
             marker_to_fasta[marker_name] = collated_path
+        else:
+            pending_args.append((marker_name, sample_fastas, collated_path))
 
-    logging.info(f"Collation complete — {len(marker_to_fasta)} marker(s) ready for clustering.")
+    if pending_args:
+        logging.info(
+            f"Concatenating sample FASTAs for {len(pending_args)} marker(s) "
+            f"across {threads} thread(s) ..."
+        )
+        if threads > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                for marker_name, collated_path in executor.map(_cat_one_marker, pending_args):
+                    marker_to_fasta[marker_name] = collated_path
+        else:
+            for marker_name, collated_path in map(_cat_one_marker, pending_args):
+                marker_to_fasta[marker_name] = collated_path
+        logging.info(f"Collation complete — {len(pending_args)} marker(s) concatenated.")
+    else:
+        logging.info("All collated FASTA(s) already exist — skipping concatenation.")
+
+    logging.info(f"{len(marker_to_fasta)} marker(s) ready for clustering.")
     return marker_to_fasta
 
 
@@ -542,23 +728,19 @@ def _header_sort_key(header):
 # Phase 2: cluster locally (multiprocessing across markers)
 # ---------------------------------------------------------------------------
 
-def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads):
+def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads, chunk_size=10000, cluster_threads=16):
     """Run smafa cluster for each marker in parallel (file-based, no fasta_str)."""
 
     def _cluster_one(args_tuple):
         (marker_name, fasta_path, max_divergence) = args_tuple
-        num_seqs = sum(1 for ln in open(fasta_path) if ln.startswith(">"))
-        logging.info(f"[{marker_name}] Clustering {num_seqs} OTU(s) ...")
-        cluster_tmp = _run_smafa_cluster_file(fasta_path, max_divergence, marker_name)
-        try:
-            cluster_tsv, rep_fasta = _process_cluster_file(fasta_path, cluster_tmp, marker_name)
-        finally:
-            if os.path.exists(cluster_tmp):
-                os.unlink(cluster_tmp)
+        cluster_tsv, rep_fasta = _cluster_marker_file_chunked(
+            fasta_path, max_divergence, marker_name, chunk_size=chunk_size, threads=cluster_threads
+        )
         n_clusters = len(set(
             ln.split("\t")[0] for ln in cluster_tsv.splitlines() if ln.strip()
         ))
-        logging.info(f"[{marker_name}] Done — {n_clusters} cluster(s) from {num_seqs} OTU(s).")
+        n_seqs = sum(1 for ln in cluster_tsv.splitlines() if ln.strip())
+        logging.info(f"[{marker_name}] Done — {n_clusters} cluster(s) from {n_seqs} OTU(s).")
         return (marker_name, cluster_tsv, rep_fasta)
 
     worker_args = [
@@ -616,23 +798,113 @@ def _write_summary(summary_rows, output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 helpers: streaming FASTA splitter and per-chunk stats reader
+# ---------------------------------------------------------------------------
+
+def _split_fasta_to_chunk_files(fasta_path, chunk_dir, chunk_size):
+    """
+    Stream fasta_path and write chunk_{N:04d}.fasta files to chunk_dir.
+    Returns the number of chunk files written (0 if fasta_path is empty).
+    No sequences are kept in memory beyond a single entry at a time.
+    """
+    os.makedirs(chunk_dir, exist_ok=True)
+    chunk_idx = 0
+    seq_count_in_chunk = 0
+    out_fh = None
+    current_header = None
+    seq_parts = []
+
+    def _write_seq(header, parts):
+        nonlocal out_fh, chunk_idx, seq_count_in_chunk
+        seq = "".join(parts)
+        if not seq:
+            return
+        if out_fh is None or seq_count_in_chunk >= chunk_size:
+            if out_fh is not None:
+                out_fh.close()
+                chunk_idx += 1
+            out_fh = open(os.path.join(chunk_dir, f"chunk_{chunk_idx:04d}.fasta"), "w")
+            seq_count_in_chunk = 0
+        out_fh.write(header + "\n" + seq + "\n")
+        seq_count_in_chunk += 1
+
+    with open(fasta_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if current_header is not None and seq_parts:
+                    _write_seq(current_header, seq_parts)
+                current_header = line
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+    if current_header is not None and seq_parts:
+        _write_seq(current_header, seq_parts)
+
+    if out_fh is not None:
+        out_fh.close()
+        return chunk_idx + 1
+    return 0
+
+
+def _stream_chunk_seq_stats(chunk_fasta_path):
+    """
+    Stream a FASTA file and return {seq -> (unknown_rank, hits)} for all sequences.
+    Only the two stat integers (not the header string) are stored per sequence.
+    """
+    seq_to_stats = {}
+    current_header = None
+    seq_parts = []
+    with open(chunk_fasta_path) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if current_header is not None and seq_parts:
+                    seq = "".join(seq_parts)
+                    seq_to_stats.setdefault(seq, _parse_header_stats(current_header))
+                current_header = line
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+    if current_header is not None and seq_parts:
+        seq_to_stats.setdefault("".join(seq_parts), _parse_header_stats(current_header))
+    return seq_to_stats
+
+
+# ---------------------------------------------------------------------------
 # Phase 3 (mqsub): submit one smafa cluster job per marker
 # ---------------------------------------------------------------------------
 
 def _already_clustered(output_dir, marker_name):
-    """Return True if this marker's clusters.tsv already exists and is non-empty."""
-    clusters_path = os.path.join(output_dir, marker_name, "clusters.tsv")
-    return os.path.exists(clusters_path) and os.path.getsize(clusters_path) > 0
+    """Return True if this marker's representatives.fasta already exists and is non-empty."""
+    rep_path = os.path.join(output_dir, marker_name, "representatives.fasta")
+    return os.path.exists(rep_path) and os.path.getsize(rep_path) > 0
 
 
 def cluster_markers_via_mqsub(
     marker_to_fasta, output_dir, max_divergence, this_script_path, cluster_memory=64,
-    cluster_threads=32,
+    cluster_threads=16, chunk_size=10000,
 ):
-    """Submit one mqsub job per marker for smafa cluster."""
+    """
+    Submit smafa cluster jobs via mqsub, one job per (marker, chunk) pair.
+
+    All markers' chunk-N jobs are submitted together as a single mqsub batch,
+    waited on, then chunk N+1 is submitted, etc.
+
+    The orchestrator NEVER loads full sequence data into memory.  Instead:
+      Phase A — each marker's collated FASTA is split into chunk files on disk
+                 (streaming, one sequence at a time).
+      Phase B — per round, prev_reps.fasta (small) is catenated with the next
+                 chunk file; workers run smafa and write clusters.tsv +
+                 reps.fasta; the orchestrator streams clusters.tsv to
+                 accumulate per-cluster stat counters (not full member lists).
+      Phase C — representatives.fasta is written from the final reps.fasta +
+                 accumulated stats.  No full clusters.tsv is written for the
+                 large-scale mqsub path (it would be tens of GB per marker).
+    """
     abs_output_dir = os.path.abspath(output_dir)
 
-    # Skip markers already clustered successfully
+    # Skip markers already clustered successfully.
     pending = {
         m: p for m, p in marker_to_fasta.items()
         if not _already_clustered(abs_output_dir, m)
@@ -643,62 +915,244 @@ def cluster_markers_via_mqsub(
     if not pending:
         logging.info("All markers already clustered.")
     else:
-        logging.info(
-            f"Submitting {len(pending)} smafa cluster job(s) via mqsub ..."
-        )
-        with tempfile.NamedTemporaryFile(
-            mode="w", prefix="smafa_cluster_mqsub_", suffix=".cmds", delete=False
-        ) as cmd_file:
-            cmd_file_path = cmd_file.name
-            for marker_name, fasta_path in pending.items():
-                cmd = (
-                    f"python3 {this_script_path}"
-                    f" --_cluster-marker-fasta {os.path.abspath(fasta_path)}"
-                    f" --_marker-name {marker_name}"
-                    f" --output-directory {abs_output_dir}"
-                    f" --max-divergence {max_divergence}"
-                    f" --_cluster-threads {cluster_threads}"
-                )
-                cmd_file.write(cmd + "\n")
-
-        try:
-            mqsub_cmd = (
-                f"mqsub -m {cluster_memory} -t {cluster_threads} --name smafa_cluster"
-                f" --segregated-log-files"
-                f" --hours 12"
-                f" --command-file {cmd_file_path}"
-                f" --chunk-size 1 2>&1"
+        # ------------------------------------------------------------------
+        # Phase A: pre-split collated FASTAs into chunk files (streaming).
+        # One marker at a time keeps peak memory at chunk_size sequences.
+        # ------------------------------------------------------------------
+        n_chunks_per_marker = {}
+        for marker_name, fasta_path in pending.items():
+            chunk_dir = os.path.join(abs_output_dir, marker_name, "chunks")
+            # Resume: count existing chunk files so we don't re-split.
+            existing = sorted(
+                f for f in (os.listdir(chunk_dir) if os.path.isdir(chunk_dir) else [])
+                if f.startswith("chunk_") and f.endswith(".fasta") and "input" not in f
             )
-            logging.info(f"Running: {mqsub_cmd}")
-            mqsub_stdout = extern.run(mqsub_cmd)
-            logging.info(f"Submitted {len(pending)} mqsub job(s).")
-            _mqwait(mqsub_stdout)
-        finally:
-            os.unlink(cmd_file_path)
+            if existing:
+                n_chunks_per_marker[marker_name] = len(existing)
+                logging.info(
+                    f"[{marker_name}] Resuming — found {len(existing)} existing chunk file(s)."
+                )
+            else:
+                logging.info(
+                    f"[{marker_name}] Splitting collated FASTA into chunk(s) of {chunk_size} ..."
+                )
+                n = _split_fasta_to_chunk_files(fasta_path, chunk_dir, chunk_size)
+                n_chunks_per_marker[marker_name] = n
+                logging.info(f"[{marker_name}] Split into {n} chunk(s).")
+
+        max_rounds = max(n_chunks_per_marker.values(), default=0)
+        logging.info(
+            f"Clustering {len(pending)} marker(s) over {max_rounds} round(s) via mqsub "
+            f"(streaming orchestrator — no sequences in orchestrator memory)."
+        )
+
+        # Per-marker in-memory state (only small stats dicts, no sequence strings).
+        # marker_rep_stats:          {marker -> {rep_seq -> {n_seqs,n_query,max_hits,total_hits}}}
+        # marker_current_reps_fasta: {marker -> path to most-recent round_*_reps.fasta}
+        marker_rep_stats = {m: {} for m in pending}
+        marker_current_reps_fasta = {m: None for m in pending}
+
+        # ------------------------------------------------------------------
+        # Phase B: round-by-round mqsub submission.
+        # ------------------------------------------------------------------
+        for chunk_idx in range(max_rounds):
+            # Build the list of (marker, paths) for this round.
+            round_jobs = []  # (marker_name, initial_chunk, round_input, round_clusters, round_reps)
+            for marker_name in list(pending.keys()):
+                if chunk_idx >= n_chunks_per_marker[marker_name]:
+                    continue
+                chunk_dir      = os.path.join(abs_output_dir, marker_name, "chunks")
+                initial_chunk  = os.path.join(chunk_dir, f"chunk_{chunk_idx:04d}.fasta")
+                round_input    = os.path.join(chunk_dir, f"round_{chunk_idx:04d}_input.fasta")
+                round_clusters = os.path.join(chunk_dir, f"round_{chunk_idx:04d}_clusters.tsv")
+                round_reps     = os.path.join(chunk_dir, f"round_{chunk_idx:04d}_reps.fasta")
+
+                # Resume: if the clusters file already exists this round is done.
+                if os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0:
+                    logging.info(
+                        f"[{marker_name}] Round {chunk_idx + 1} already done — will propagate."
+                    )
+                else:
+                    # Build round_input by streaming prev_reps + initial_chunk.
+                    prev_reps = marker_current_reps_fasta[marker_name]
+                    sources = ([prev_reps] if prev_reps else []) + [initial_chunk]
+                    with open(round_input, "w") as out_fh:
+                        for src in sources:
+                            with open(src) as in_fh:
+                                shutil.copyfileobj(in_fh, out_fh)
+
+                round_jobs.append(
+                    (marker_name, initial_chunk, round_input, round_clusters, round_reps)
+                )
+
+            if not round_jobs:
+                continue
+
+            # Submit only the jobs whose cluster output doesn't exist yet.
+            jobs_to_submit = [
+                (mn, ic, ri, rc, rr) for (mn, ic, ri, rc, rr) in round_jobs
+                if not (os.path.exists(rc) and os.path.getsize(rc) > 0)
+            ]
+
+            if jobs_to_submit:
+                logging.info(
+                    f"Round {chunk_idx + 1}/{max_rounds}: submitting "
+                    f"{len(jobs_to_submit)} smafa chunk job(s) via mqsub ..."
+                )
+                with tempfile.NamedTemporaryFile(
+                    mode="w", prefix=f"smafa_chunk{chunk_idx:04d}_mqsub_",
+                    suffix=".cmds", delete=False,
+                ) as cmd_file:
+                    cmd_file_path = cmd_file.name
+                    for _mn, _ic, round_input, round_clusters, round_reps in jobs_to_submit:
+                        cmd = (
+                            f"python3 {this_script_path}"
+                            f" --_cluster-chunk-fasta {round_input}"
+                            f" --_chunk-clusters-tsv {round_clusters}"
+                            f" --_chunk-reps-fasta {round_reps}"
+                            f" --max-divergence {max_divergence}"
+                            f" --_cluster-threads {cluster_threads}"
+                        )
+                        cmd_file.write(cmd + "\n")
+                try:
+                    mqsub_cmd = (
+                        f"mqsub -m {cluster_memory} -t {cluster_threads}"
+                        f" --name smafa_chunk_{chunk_idx:04d}"
+                        f" --segregated-log-files --hours 48"
+                        f" --command-file {cmd_file_path}"
+                        f" --chunk-size 1 2>&1"
+                    )
+                    logging.info(f"Running: {mqsub_cmd}")
+                    mqsub_stdout = extern.run(mqsub_cmd)
+                    _mqwait(mqsub_stdout)
+                finally:
+                    os.unlink(cmd_file_path)
+
+                logging.info(f"Round {chunk_idx + 1}/{max_rounds} mqsub jobs complete.")
+
+            # Propagate state: stream clusters.tsv to update per-cluster stats.
+            failed = []
+            for marker_name, initial_chunk, _round_input, round_clusters, round_reps in round_jobs:
+                if not os.path.exists(round_clusters) or os.path.getsize(round_clusters) == 0:
+                    failed.append(marker_name)
+                    continue
+
+                old_rep_stats = marker_rep_stats[marker_name]
+
+                # Stats for brand-new sequences in this chunk (O(chunk_size) memory).
+                chunk_seq_to_stats = _stream_chunk_seq_stats(initial_chunk)
+
+                new_rep_stats = {}
+                with open(round_clusters) as cf:
+                    for line in cf:
+                        parts = line.rstrip("\n").split("\t")
+                        if len(parts) < 2:
+                            continue
+                        member_seq = parts[0]
+                        rep_seq    = parts[1]
+                        if rep_seq not in new_rep_stats:
+                            new_rep_stats[rep_seq] = {
+                                "n_seqs": 0, "n_query": 0,
+                                "max_hits": 0, "total_hits": 0,
+                            }
+                        s = new_rep_stats[rep_seq]
+                        if member_seq in old_rep_stats:
+                            # Member was a previous round's rep: merge accumulated stats.
+                            ms = old_rep_stats[member_seq]
+                            s["n_seqs"]     += ms["n_seqs"]
+                            s["n_query"]    += ms["n_query"]
+                            s["max_hits"]    = max(s["max_hits"], ms["max_hits"])
+                            s["total_hits"] += ms["total_hits"]
+                        else:
+                            # Member is a new sequence from this chunk.
+                            unk, hits = chunk_seq_to_stats.get(member_seq, (1, 0))
+                            s["n_seqs"]     += 1
+                            s["n_query"]    += (1 if unk == 0 else 0)
+                            s["max_hits"]    = max(s["max_hits"], hits)
+                            s["total_hits"] += hits
+
+                marker_rep_stats[marker_name] = new_rep_stats
+                marker_current_reps_fasta[marker_name] = round_reps
+                logging.info(
+                    f"[{marker_name}] After round {chunk_idx + 1}: "
+                    f"{len(new_rep_stats)} cluster(s)."
+                )
+
+            if failed:
+                raise RuntimeError(
+                    f"{len(failed)} smafa chunk job(s) failed in round {chunk_idx + 1}:\n"
+                    + "\n".join(f"  {m}" for m in sorted(failed))
+                )
+
+        # ------------------------------------------------------------------
+        # Phase C: write representatives.fasta per marker from accumulated stats.
+        # ------------------------------------------------------------------
+        for marker_name in list(pending.keys()):
+            fasta_path = pending[marker_name]
+            rep_stats  = marker_rep_stats[marker_name]
+            reps_fasta = marker_current_reps_fasta[marker_name]
+
+            marker_dir = os.path.join(abs_output_dir, marker_name)
+            os.makedirs(marker_dir, exist_ok=True)
+
+            # Read the final round's reps.fasta to get original headers for each rep seq.
+            rep_to_header = {}
+            if reps_fasta and os.path.exists(reps_fasta):
+                cur_hdr = None
+                seq_parts = []
+                with open(reps_fasta) as fh:
+                    for line in fh:
+                        line = line.rstrip("\n")
+                        if line.startswith(">"):
+                            if cur_hdr is not None and seq_parts:
+                                rep_to_header["".join(seq_parts).replace('-', 'N')] = cur_hdr
+                            cur_hdr = line
+                            seq_parts = []
+                        else:
+                            seq_parts.append(line)
+                if cur_hdr is not None and seq_parts:
+                    rep_to_header["".join(seq_parts).replace('-', 'N')] = cur_hdr
+
+            # Write representatives.fasta with enriched headers.
+            rep_fasta_path = os.path.join(marker_dir, "representatives.fasta")
+            n_clusters = 0
+            with open(rep_fasta_path, "w") as out_fh:
+                for rep_seq, stats in rep_stats.items():
+                    orig_header = rep_to_header.get(rep_seq)
+                    if orig_header is None:
+                        logging.warning(
+                            f"[{marker_name}] Rep sequence not found in reps.fasta — skipping: {rep_seq}"
+                        )
+                        continue
+                    enriched = (
+                        f"{orig_header}"
+                        f"|cluster_size={stats['n_seqs']}"
+                        f"|n_query={stats['n_query']}"
+                        f"|max_hits={stats['max_hits']}"
+                        f"|total_hits={stats['total_hits']}"
+                    )
+                    out_fh.write(enriched + "\n" + rep_seq + "\n")
+                    n_clusters += 1
+
+            n_otus = 0
+            if os.path.exists(fasta_path):
+                with open(fasta_path) as fh:
+                    n_otus = sum(1 for ln in fh if ln.startswith(">"))
+            logging.info(
+                f"[{marker_name}] Done — {n_clusters} cluster(s) from {n_otus} OTU(s)."
+            )
 
         logging.info("All smafa cluster jobs finished.")
 
-        # Check for failures: any pending marker missing its clusters.tsv
-        failed = [
-            m for m in pending
-            if not _already_clustered(abs_output_dir, m)
-        ]
-        if failed:
-            raise RuntimeError(
-                f"{len(failed)} smafa cluster job(s) failed (no output produced):\n"
-                + "\n".join(f"  {m}" for m in sorted(failed))
-            )
-
-    # Aggregate summary across all marker dirs (each worker only wrote its own
-    # cluster files; writing summary here ensures all markers are included).
+    # Aggregate summary across all marker dirs (read from representatives.fasta).
     summary_rows = []
     for marker_name, fasta_path in marker_to_fasta.items():
-        marker_dir = os.path.join(abs_output_dir, marker_name)
-        clusters_path = os.path.join(marker_dir, "clusters.tsv")
+        marker_dir     = os.path.join(abs_output_dir, marker_name)
+        rep_fasta_path = os.path.join(marker_dir, "representatives.fasta")
         num_clusters = 0
-        if os.path.exists(clusters_path):
-            with open(clusters_path) as fh:
-                num_clusters = sum(1 for ln in fh if ln.strip())
+        if os.path.exists(rep_fasta_path):
+            with open(rep_fasta_path) as fh:
+                num_clusters = sum(1 for ln in fh if ln.startswith(">"))
         num_otus = 0
         if os.path.exists(fasta_path):
             with open(fasta_path) as fh:
@@ -724,6 +1178,8 @@ def _mqwait(mqsub_log):
         if m:
             job_ids.append(m.group(1))
     logging.info(f"Waiting for {len(job_ids)} job(s) to finish ...")
+    if not job_ids:
+        return
     with tempfile.NamedTemporaryFile(mode="w", prefix="mqwait_", suffix=".ids") as f:
         f.write('\n'.join(job_ids) + '\n')
         f.flush()
@@ -754,25 +1210,74 @@ def worker_extract_sample(archive_path, marker_domains_tsv, sample_fasta_dir, ma
     logging.info(f"Extracted {len(seen)} marker(s) from {archive_path}")
 
 
-def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence, threads=1):
+def worker_cluster_chunk(input_fasta, output_clusters_tsv, output_reps_fasta, max_divergence, threads=16):
+    """Entry point for a single-chunk smafa cluster mqsub job.
+
+    Runs smafa on input_fasta, writes clusters.tsv and (if output_reps_fasta is
+    given) a reps.fasta containing the header+sequence for each unique centroid.
+    """
+    if not os.path.exists(input_fasta) or os.path.getsize(input_fasta) == 0:
+        logging.warning(f"Empty or missing chunk FASTA: {input_fasta} — writing empty output.")
+        open(output_clusters_tsv, "w").close()
+        if output_reps_fasta:
+            open(output_reps_fasta, "w").close()
+        return
+    n_seqs = sum(1 for ln in open(input_fasta) if ln.startswith(">"))
+    logging.info(f"Running smafa on {n_seqs} sequence(s) from {input_fasta} ...")
+    cluster_tmp = _run_smafa_cluster_file(input_fasta, max_divergence, "chunk", threads=threads)
+    try:
+        shutil.move(cluster_tmp, output_clusters_tsv)
+    except Exception:
+        if os.path.exists(cluster_tmp):
+            os.unlink(cluster_tmp)
+        raise
+    centroid_seqs = set()
+    with open(output_clusters_tsv) as cf:
+        for line in cf:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2:
+                centroid_seqs.add(parts[1])
+    n_clusters = len(centroid_seqs)
+    logging.info(f"Chunk done — {n_clusters} cluster(s) from {n_seqs} sequence(s).")
+
+    # Write reps.fasta: scan input_fasta for sequences that are centroids.
+    if output_reps_fasta:
+        with open(output_reps_fasta, "w") as out_fh:
+            cur_hdr = None
+            seq_parts = []
+            with open(input_fasta) as fh:
+                for line in fh:
+                    line = line.rstrip("\n")
+                    if line.startswith(">"):
+                        if cur_hdr is not None and seq_parts:
+                            seq = "".join(seq_parts)
+                            if seq.replace('-', 'N') in centroid_seqs:
+                                out_fh.write(cur_hdr + "\n" + seq + "\n")
+                        cur_hdr = line
+                        seq_parts = []
+                    else:
+                        seq_parts.append(line)
+            if cur_hdr is not None and seq_parts:
+                seq = "".join(seq_parts)
+                if seq.replace('-', 'N') in centroid_seqs:
+                    out_fh.write(cur_hdr + "\n" + seq + "\n")
+
+
+def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence, chunk_size=10000, cluster_threads=16):
     """Entry point for per-marker smafa cluster mqsub jobs (file-based, no fasta_str)."""
     if not os.path.exists(fasta_path) or os.path.getsize(fasta_path) == 0:
         logging.warning(f"[{marker_name}] Empty or missing FASTA — skipping.")
         return
-    num_seqs = sum(1 for ln in open(fasta_path) if ln.startswith(">"))
-    logging.info(f"[{marker_name}] Clustering {num_seqs} OTU(s) ...")
-    cluster_tmp = _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=threads)
-    try:
-        cluster_tsv, rep_fasta = _process_cluster_file(fasta_path, cluster_tmp, marker_name)
-    finally:
-        if os.path.exists(cluster_tmp):
-            os.unlink(cluster_tmp)
+    cluster_tsv, rep_fasta = _cluster_marker_file_chunked(
+        fasta_path, max_divergence, marker_name, chunk_size=chunk_size, threads=cluster_threads
+    )
     result = (marker_name, cluster_tsv, rep_fasta)
     _write_cluster_results([result], {marker_name: fasta_path}, output_dir)
     n_clusters = len(set(
         ln.split("\t")[0] for ln in cluster_tsv.splitlines() if ln.strip()
     ))
-    logging.info(f"[{marker_name}] Done — {n_clusters} cluster(s) from {num_seqs} OTU(s).")
+    n_seqs = sum(1 for ln in cluster_tsv.splitlines() if ln.strip())
+    logging.info(f"[{marker_name}] Done — {n_clusters} cluster(s) from {n_seqs} OTU(s).")
     logging.info(f"[{marker_name}] Cluster job complete.")  # summary.tsv written by orchestrator
 
 
@@ -790,7 +1295,8 @@ def collate_and_cluster(
     run_through_mqsub,
     this_script_path,
     cluster_memory=64,
-    cluster_threads=32,
+    cluster_threads=16,
+    chunk_size=10000,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -833,6 +1339,7 @@ def collate_and_cluster(
             marker_to_fasta, output_dir, max_divergence, this_script_path,
             cluster_memory=cluster_memory,
             cluster_threads=cluster_threads,
+            chunk_size=chunk_size,
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
@@ -864,7 +1371,8 @@ def collate_and_cluster(
             logging.warning("No markers with sequences — nothing to cluster.")
             return
         cluster_markers_locally(
-            marker_to_fasta, output_dir, max_divergence, threads
+            marker_to_fasta, output_dir, max_divergence, threads,
+            chunk_size=chunk_size, cluster_threads=cluster_threads
         )
 
     logging.info("Done.")
@@ -910,7 +1418,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output-directory",
-        required=True,
+        required=False,
         metavar="DIR",
         help="Directory to write per-marker cluster outputs",
     )
@@ -953,15 +1461,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cluster-threads",
         type=int,
-        default=32,
+        default=16,
         metavar="N",
-        help="Threads per smafa cluster mqsub job (default: 32)",
+        help="Threads for smafa per chunk (and per mqsub job) (default: 16)",
+    )
+
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=10000,
+        metavar="N",
+        help="Number of sequences per smafa clustering chunk (default: 10000)",
     )
 
     # --- Internal: used only when this script is re-invoked by an mqsub worker ---
+    parser.add_argument("--_cluster-chunk-fasta", metavar="FILE", help=argparse.SUPPRESS)
+    parser.add_argument("--_chunk-clusters-tsv", metavar="FILE", help=argparse.SUPPRESS)
+    parser.add_argument("--_chunk-reps-fasta", metavar="FILE", help=argparse.SUPPRESS)
+    parser.add_argument("--_cluster-threads", type=int, default=16, help=argparse.SUPPRESS)
+    # Kept for backward-compat with any running jobs; not used by new orchestrator
     parser.add_argument("--_cluster-marker-fasta", metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--_marker-name", metavar="NAME", help=argparse.SUPPRESS)
-    parser.add_argument("--_cluster-threads", type=int, default=16, help=argparse.SUPPRESS)
+    parser.add_argument("--_chunk-size", type=int, default=10000, help=argparse.SUPPRESS)
     # Per-sample extraction worker args
     parser.add_argument("--_extract-sample-archive", metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--_marker-domains-tsv", metavar="FILE", help=argparse.SUPPRESS)
@@ -996,7 +1517,20 @@ if __name__ == "__main__":
         )
         sys.exit(0)
 
-    # --- Worker path: per-marker smafa cluster (invoked by mqsub) ---
+    # --- Worker path: single-chunk smafa cluster job (invoked by mqsub) ---
+    if args._cluster_chunk_fasta:
+        if not args._chunk_clusters_tsv:
+            parser.error("--_cluster-chunk-fasta requires --_chunk-clusters-tsv")
+        worker_cluster_chunk(
+            input_fasta=args._cluster_chunk_fasta,
+            output_clusters_tsv=args._chunk_clusters_tsv,
+            output_reps_fasta=args._chunk_reps_fasta,
+            max_divergence=args.max_divergence,
+            threads=args._cluster_threads,
+        )
+        sys.exit(0)
+
+    # --- Worker path: per-marker smafa cluster (backward-compat) ---
     if args._cluster_marker_fasta:
         if not args._marker_name:
             parser.error("--_cluster-marker-fasta requires --_marker-name")
@@ -1005,11 +1539,14 @@ if __name__ == "__main__":
             marker_name=args._marker_name,
             output_dir=args.output_directory,
             max_divergence=args.max_divergence,
-            threads=args._cluster_threads,
+            chunk_size=args._chunk_size,
+            cluster_threads=args._cluster_threads,
         )
         sys.exit(0)
 
     # --- Normal path ---
+    if not args.output_directory:
+        parser.error("--output-directory is required.")
     if not args.input_archive_otu_tables and not args.input_archive_otu_table_list:
         parser.error(
             "One of --input-archive-otu-tables or --input-archive-otu-table-list is required."
@@ -1032,4 +1569,5 @@ if __name__ == "__main__":
         this_script_path=_this_script,
         cluster_memory=args.cluster_memory,
         cluster_threads=args.cluster_threads,
+        chunk_size=args.chunk_size,
     )
