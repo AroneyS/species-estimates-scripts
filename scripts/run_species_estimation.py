@@ -1015,26 +1015,70 @@ def _already_clustered(output_dir, marker_name):
     return os.path.exists(rep_path) and os.path.getsize(rep_path) > 0
 
 
+def _write_chunk_at_offset(dedup_path, seq_start, n_seqs, out_path):
+    """
+    Stream dedup_path and write sequences [seq_start, seq_start+n_seqs) to out_path.
+    Returns the actual number of sequences written.
+    """
+    written = 0
+    seq_idx = 0
+    cur_hdr = None
+    seq_parts = []
+    with open(dedup_path) as in_fh, open(out_path, "w") as out_fh:
+        for line in in_fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                if cur_hdr is not None and seq_parts:
+                    if seq_start <= seq_idx < seq_start + n_seqs:
+                        out_fh.write(cur_hdr + "\n" + "".join(seq_parts) + "\n")
+                        written += 1
+                    seq_idx += 1
+                    if seq_idx >= seq_start + n_seqs:
+                        return written
+                cur_hdr = line
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+        if cur_hdr is not None and seq_parts and seq_start <= seq_idx < seq_start + n_seqs:
+            out_fh.write(cur_hdr + "\n" + "".join(seq_parts) + "\n")
+            written += 1
+    return written
+
+
+def _adaptive_chunk_size(model_b, model_c, R_k, target_min, seqs_remaining):
+    """
+    Solve b*n^2 + c*R_k*n = target_min for n.
+    Falls back to seqs_remaining if model is not yet fitted.
+    """
+    if model_b is None:
+        return seqs_remaining
+    if model_c is None or R_k == 0:
+        # Only quadratic term: n = sqrt(target / b)
+        n = int((target_min / model_b) ** 0.5)
+    else:
+        # Quadratic formula: b*n^2 + c*R_k*n - target = 0
+        disc = (model_c * R_k) ** 2 + 4 * model_b * target_min
+        n = int((-model_c * R_k + disc ** 0.5) / (2 * model_b))
+    return max(1, min(n, seqs_remaining))
+
+
 def cluster_markers_via_mqsub(
     marker_to_fasta, output_dir, max_divergence, this_script_path, cluster_memory=64,
-    cluster_threads=16, chunk_size=2000000,
+    cluster_threads=16, chunk_size=2000000, target_walltime_hours=24.0,
 ):
     """
-    Submit smafa cluster jobs via mqsub, one job per (marker, chunk) pair.
+    Submit smafa cluster jobs via mqsub, one job per (marker, round) pair.
 
-    All markers' chunk-N jobs are submitted together as a single mqsub batch,
-    waited on, then chunk N+1 is submitted, etc.
+    All markers' round-N jobs are submitted together as a single mqsub batch,
+    waited on, then round N+1 is submitted, etc.
 
     The orchestrator NEVER loads full sequence data into memory.  Instead:
-      Phase A — each marker's collated FASTA is split into chunk files on disk
-                 (streaming, one sequence at a time).
-      Phase B — per round, prev_reps.fasta (small) is catenated with the next
-                 chunk file; workers run smafa and write clusters.tsv +
-                 reps.fasta; the orchestrator streams clusters.tsv to
-                 accumulate per-cluster stat counters (not full member lists).
+      Phase A — each marker's collated FASTA is deduplicated (disk sort).
+      Phase B — per round, prev_reps.fasta is catenated with a new chunk of
+                 sequences; the chunk size adapts each round to keep per-job
+                 walltime at target_walltime_hours (model fitted from .OU logs).
       Phase C — representatives.fasta is written from the final reps.fasta +
-                 accumulated stats.  No full clusters.tsv is written for the
-                 large-scale mqsub path (it would be tens of GB per marker).
+                 accumulated stats.
     """
     abs_output_dir = os.path.abspath(output_dir)
 
@@ -1049,106 +1093,189 @@ def cluster_markers_via_mqsub(
     if not pending:
         logging.info("All markers already clustered.")
     else:
-        # ------------------------------------------------------------------
-        # Phase A: pre-split collated FASTAs into chunk files (streaming).
-        # One marker at a time keeps peak memory at chunk_size sequences.
-        # ------------------------------------------------------------------
-        n_chunks_per_marker = {}
-        for marker_name, fasta_path in pending.items():
-            chunk_dir = os.path.join(abs_output_dir, marker_name, "chunks")
-            # Resume: count existing chunk files so we don't re-split.
-            existing = sorted(
-                f for f in (os.listdir(chunk_dir) if os.path.isdir(chunk_dir) else [])
-                if f.startswith("chunk_") and f.endswith(".fasta") and "input" not in f
-            )
-            if existing:
-                n_chunks_per_marker[marker_name] = len(existing)
-                logging.info(
-                    f"[{marker_name}] Resuming — found {len(existing)} existing chunk file(s)."
-                )
-            else:
-                # Deduplicate by sequence before splitting (keeps first header per unique seq).
-                marker_dir = os.path.join(abs_output_dir, marker_name)
-                os.makedirs(marker_dir, exist_ok=True)
-                dedup_path = os.path.join(marker_dir, "deduplicated.fasta")
-                if not os.path.exists(dedup_path) or os.path.getsize(dedup_path) == 0:
-                    logging.info(
-                        f"[{marker_name}] Deduplicating collated FASTA (aggregating counts) ..."
-                    )
-                    _dedup_fasta_with_counts(fasta_path, dedup_path)
-                    logging.info(f"[{marker_name}] Deduplication complete.")
-                else:
-                    logging.info(
-                        f"[{marker_name}] Deduplicated FASTA already exists — skipping."
-                    )
-                logging.info(
-                    f"[{marker_name}] Splitting deduplicated FASTA into chunk(s) of {chunk_size} ..."
-                )
-                n = _split_fasta_to_chunk_files(dedup_path, chunk_dir, chunk_size)
-                n_chunks_per_marker[marker_name] = n
-                logging.info(f"[{marker_name}] Split into {n} chunk(s).")
+        target_min = target_walltime_hours * 60.0
 
-        max_rounds = max(n_chunks_per_marker.values(), default=0)
-        logging.info(
-            f"Clustering {len(pending)} marker(s) over {max_rounds} round(s) via mqsub "
-            f"(streaming orchestrator — no sequences in orchestrator memory)."
-        )
+        # ------------------------------------------------------------------
+        # Phase A: deduplicate each collated FASTA (streaming, disk sort).
+        # ------------------------------------------------------------------
+        marker_dedup_fasta = {}   # marker -> path to deduplicated.fasta
+        marker_total_seqs  = {}   # marker -> total unique seq count
+        for marker_name, fasta_path in pending.items():
+            marker_dir = os.path.join(abs_output_dir, marker_name)
+            os.makedirs(marker_dir, exist_ok=True)
+            dedup_path = os.path.join(marker_dir, "deduplicated.fasta")
+            if not os.path.exists(dedup_path) or os.path.getsize(dedup_path) == 0:
+                logging.info(
+                    f"[{marker_name}] Deduplicating collated FASTA (aggregating counts) ..."
+                )
+                _dedup_fasta_with_counts(fasta_path, dedup_path)
+                logging.info(f"[{marker_name}] Deduplication complete.")
+            else:
+                logging.info(
+                    f"[{marker_name}] Deduplicated FASTA already exists — skipping."
+                )
+            n_unique = sum(1 for ln in open(dedup_path) if ln.startswith(">"))
+            marker_dedup_fasta[marker_name] = dedup_path
+            marker_total_seqs[marker_name]  = n_unique
+            logging.info(f"[{marker_name}] {n_unique} unique sequence(s) to cluster.")
 
         # Per-marker in-memory state (only small stats dicts, no sequence strings).
-        # marker_rep_stats:          {marker -> {rep_seq -> {n_seqs,n_query,max_hits,total_hits}}}
-        # marker_current_reps_fasta: {marker -> path to most-recent round_*_reps.fasta}
-        marker_rep_stats = {m: {} for m in pending}
+        marker_rep_stats          = {m: {} for m in pending}
         marker_current_reps_fasta = {m: None for m in pending}
 
+        # Reconstruct how many sequences each marker has already consumed and
+        # rebuild rep stats / current_reps_fasta by replaying completed rounds.
+        marker_seqs_consumed = {m: 0 for m in pending}
+
+        # Find the highest completed round index across all markers.
+        max_existing_round = -1
+        for marker_name in pending:
+            chunk_dir = os.path.join(abs_output_dir, marker_name, "chunks")
+            if not os.path.isdir(chunk_dir):
+                continue
+            for fname in os.listdir(chunk_dir):
+                if fname.startswith("round_") and fname.endswith("_clusters.tsv"):
+                    try:
+                        idx = int(fname[len("round_"):len("round_") + 4])
+                        max_existing_round = max(max_existing_round, idx)
+                    except ValueError:
+                        pass
+
+        if max_existing_round >= 0:
+            logging.info(
+                f"Resuming — replaying {max_existing_round + 1} completed round(s) "
+                f"to rebuild orchestrator state ..."
+            )
+            for ridx in range(max_existing_round + 1):
+                for marker_name in list(pending.keys()):
+                    chunk_dir      = os.path.join(abs_output_dir, marker_name, "chunks")
+                    initial_chunk  = os.path.join(chunk_dir, f"round_{ridx:04d}_chunk.fasta")
+                    round_clusters = os.path.join(chunk_dir, f"round_{ridx:04d}_clusters.tsv")
+                    round_reps     = os.path.join(chunk_dir, f"round_{ridx:04d}_reps.fasta")
+                    if not (os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0):
+                        continue
+                    if not os.path.exists(initial_chunk):
+                        continue
+
+                    old_rep_stats = marker_rep_stats[marker_name]
+                    chunk_seq_to_stats = _stream_chunk_seq_stats(initial_chunk)
+                    new_rep_stats = {}
+                    with open(round_clusters) as cf:
+                        for line in cf:
+                            parts = line.rstrip("\n").split("\t")
+                            if len(parts) < 2:
+                                continue
+                            member_seq, rep_seq = parts[0], parts[1]
+                            if rep_seq not in new_rep_stats:
+                                new_rep_stats[rep_seq] = {
+                                    "n_seqs": 0, "n_query": 0,
+                                    "max_hits": 0, "total_hits": 0,
+                                }
+                            s = new_rep_stats[rep_seq]
+                            if member_seq in old_rep_stats:
+                                ms = old_rep_stats[member_seq]
+                                s["n_seqs"]     += ms["n_seqs"]
+                                s["n_query"]    += ms["n_query"]
+                                s["max_hits"]    = max(s["max_hits"], ms["max_hits"])
+                                s["total_hits"] += ms["total_hits"]
+                            else:
+                                unk, hits, n_occ, sum_hits_all = chunk_seq_to_stats.get(member_seq, (1, 0, 1, 0))
+                                s["n_seqs"]     += n_occ
+                                s["n_query"]    += (n_occ if unk == 0 else 0)
+                                s["max_hits"]    = max(s["max_hits"], hits)
+                                s["total_hits"] += sum_hits_all
+
+                    n_actual = sum(1 for ln in open(initial_chunk) if ln.startswith(">"))
+                    marker_rep_stats[marker_name]          = new_rep_stats
+                    marker_current_reps_fasta[marker_name] = round_reps
+                    marker_seqs_consumed[marker_name]      += n_actual
+
+            for marker_name in pending:
+                logging.info(
+                    f"[{marker_name}] Resumed: {marker_seqs_consumed[marker_name]}/"
+                    f"{marker_total_seqs[marker_name]} seq(s) consumed, "
+                    f"{len(marker_rep_stats[marker_name])} cluster(s)."
+                )
+
+        # Adaptive timing model (shared across markers; fitted from .OU walltimes).
+        # t ≈ model_b * n² + model_c * R_k * n
+        model_file = os.path.join(abs_output_dir, "timing_model.json")
+        model_b: float | None = None
+        model_c: float | None = None
+        if os.path.exists(model_file):
+            with open(model_file) as _mf:
+                _md = json.load(_mf)
+            model_b = _md.get("model_b") or None
+            model_c = _md.get("model_c") or None
+            logging.info(
+                f"Loaded timing model from {model_file}: "
+                f"b={model_b}, c={model_c}"
+            )
+
         # ------------------------------------------------------------------
-        # Phase B: round-by-round mqsub submission.
+        # Phase B: round-by-round mqsub submission with adaptive chunk sizes.
         # ------------------------------------------------------------------
-        for chunk_idx in range(max_rounds):
-            # Build the list of (marker, paths) for this round.
-            round_jobs = []  # (marker_name, initial_chunk, round_input, round_clusters, round_reps)
+        round_idx = max_existing_round + 1
+        while any(marker_seqs_consumed[m] < marker_total_seqs[m] for m in pending):
+            round_jobs = []  # (marker, initial_chunk, round_input, round_clusters, round_reps, n_k)
             for marker_name in list(pending.keys()):
-                if chunk_idx >= n_chunks_per_marker[marker_name]:
+                seqs_remaining = marker_total_seqs[marker_name] - marker_seqs_consumed[marker_name]
+                if seqs_remaining <= 0:
                     continue
+
+                R_k   = len(marker_rep_stats[marker_name])
+                n_k   = _adaptive_chunk_size(model_b, model_c, R_k, target_min, seqs_remaining)
+                # For round 0, honour the user-supplied chunk_size as initial cap.
+                if round_idx == 0:
+                    n_k = min(n_k, chunk_size)
+
                 chunk_dir      = os.path.join(abs_output_dir, marker_name, "chunks")
-                initial_chunk  = os.path.join(chunk_dir, f"chunk_{chunk_idx:04d}.fasta")
-                round_input    = os.path.join(chunk_dir, f"round_{chunk_idx:04d}_input.fasta")
-                round_clusters = os.path.join(chunk_dir, f"round_{chunk_idx:04d}_clusters.tsv")
-                round_reps     = os.path.join(chunk_dir, f"round_{chunk_idx:04d}_reps.fasta")
+                os.makedirs(chunk_dir, exist_ok=True)
+                initial_chunk  = os.path.join(chunk_dir, f"round_{round_idx:04d}_chunk.fasta")
+                round_input    = os.path.join(chunk_dir, f"round_{round_idx:04d}_input.fasta")
+                round_clusters = os.path.join(chunk_dir, f"round_{round_idx:04d}_clusters.tsv")
+                round_reps     = os.path.join(chunk_dir, f"round_{round_idx:04d}_reps.fasta")
 
-                # Resume: if the clusters file already exists this round is done.
-                if os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0:
-                    logging.info(
-                        f"[{marker_name}] Round {chunk_idx + 1} already done — will propagate."
+                # Write the new-sequences chunk for this round.
+                if not os.path.exists(initial_chunk) or os.path.getsize(initial_chunk) == 0:
+                    n_written = _write_chunk_at_offset(
+                        marker_dedup_fasta[marker_name],
+                        marker_seqs_consumed[marker_name],
+                        n_k, initial_chunk,
                     )
-                else:
-                    # Build round_input by streaming prev_reps + initial_chunk.
-                    prev_reps = marker_current_reps_fasta[marker_name]
-                    sources = ([prev_reps] if prev_reps else []) + [initial_chunk]
-                    with open(round_input, "w") as out_fh:
-                        for src in sources:
-                            with open(src) as in_fh:
-                                shutil.copyfileobj(in_fh, out_fh)
+                    logging.info(
+                        f"[{marker_name}] Round {round_idx + 1}: "
+                        f"chunk of {n_written} seq(s) (R={R_k} reps, target={target_walltime_hours}h)."
+                    )
+                # Build round_input = prev_reps + initial_chunk.
+                prev_reps = marker_current_reps_fasta[marker_name]
+                sources   = ([prev_reps] if prev_reps else []) + [initial_chunk]
+                with open(round_input, "w") as out_fh:
+                    for src in sources:
+                        with open(src) as in_fh:
+                            shutil.copyfileobj(in_fh, out_fh)
 
+                # Count actual seqs in chunk (may differ from n_k at EOF).
+                n_actual = sum(1 for ln in open(initial_chunk) if ln.startswith(">"))
                 round_jobs.append(
-                    (marker_name, initial_chunk, round_input, round_clusters, round_reps)
+                    (marker_name, initial_chunk, round_input, round_clusters, round_reps, n_actual)
                 )
 
             if not round_jobs:
-                continue
+                break
 
-            # Submit only the jobs whose cluster output doesn't exist yet.
+            # Submit only jobs whose cluster output doesn't exist yet.
             jobs_to_submit = [
-                (mn, ic, ri, rc, rr) for (mn, ic, ri, rc, rr) in round_jobs
+                (mn, ic, ri, rc, rr) for (mn, ic, ri, rc, rr, _) in round_jobs
                 if not (os.path.exists(rc) and os.path.getsize(rc) > 0)
             ]
 
             if jobs_to_submit:
                 logging.info(
-                    f"Round {chunk_idx + 1}/{max_rounds}: submitting "
-                    f"{len(jobs_to_submit)} smafa chunk job(s) via mqsub ..."
+                    f"Round {round_idx + 1}: submitting {len(jobs_to_submit)} smafa job(s) via mqsub ..."
                 )
                 with tempfile.NamedTemporaryFile(
-                    mode="w", prefix=f"smafa_chunk{chunk_idx:04d}_mqsub_",
+                    mode="w", prefix=f"smafa_chunk{round_idx:04d}_mqsub_",
                     suffix=".cmds", delete=False,
                 ) as cmd_file:
                     cmd_file_path = cmd_file.name
@@ -1165,22 +1292,54 @@ def cluster_markers_via_mqsub(
                 try:
                     mqsub_cmd = (
                         f"mqsub -m {cluster_memory} -t {cluster_threads}"
-                        f" --name smafa_chunk_{chunk_idx:04d}"
+                        f" --name smafa_chunk_{round_idx:04d}"
                         f" --segregated-log-files --hours 48"
                         f" --command-file {cmd_file_path}"
                         f" --chunk-size 1 2>&1"
                     )
                     logging.info(f"Running: {mqsub_cmd}")
                     mqsub_stdout = extern.run(mqsub_cmd)
-                    _mqwait(mqsub_stdout)
+                    job_ids = _mqwait(mqsub_stdout)
                 finally:
                     os.unlink(cmd_file_path)
 
-                logging.info(f"Round {chunk_idx + 1}/{max_rounds} mqsub jobs complete.")
+                logging.info(f"Round {round_idx + 1} mqsub jobs complete.")
+
+                # Update timing model from this round's .OU walltimes.
+                walltimes = _parse_walltimes_from_job_ids(job_ids)
+                if walltimes:
+                    wt_med = sorted(walltimes)[len(walltimes) // 2]
+                    # Compute median n_k and R_k for submitted jobs only.
+                    n_vals = [n for mn, _, _, _, _, n in round_jobs
+                               if any(mn == smn for smn, *_ in jobs_to_submit)]
+                    n_med  = sorted(n_vals)[len(n_vals) // 2] if n_vals else chunk_size
+                    R_vals = [len(marker_rep_stats[mn]) for mn, *_ in round_jobs
+                               if any(mn == smn for smn, *_ in jobs_to_submit)]
+                    R_med  = sorted(R_vals)[len(R_vals) // 2] if R_vals else 0
+                    if round_idx == 0:
+                        # Fit b from t0 = b * n²
+                        model_b = wt_med / (n_med ** 2) if n_med > 0 else None
+                        logging.info(
+                            f"Timing model: b={model_b:.3e} min/seq² "
+                            f"(from round 0 median {wt_med:.1f} min, n={n_med})"
+                        )
+                    elif model_b is not None and R_med > 0:
+                        # Fit c from t1 = b*n² + c*R*n  →  c = (t - b*n²) / (R*n)
+                        cross = wt_med - model_b * n_med ** 2
+                        if cross > 0:
+                            model_c = cross / (R_med * n_med)
+                            logging.info(
+                                f"Timing model: b={model_b:.3e}, c={model_c:.3e} min/rep/seq "
+                                f"(from round {round_idx + 1} median {wt_med:.1f} min, "
+                                f"n={n_med}, R={R_med})"
+                            )
+                    # Persist updated model so resuming runs inherit it.
+                    with open(model_file, "w") as _mf:
+                        json.dump({"model_b": model_b, "model_c": model_c}, _mf)
 
             # Propagate state: stream clusters.tsv to update per-cluster stats.
             failed = []
-            for marker_name, initial_chunk, _round_input, round_clusters, round_reps in round_jobs:
+            for marker_name, initial_chunk, _round_input, round_clusters, round_reps, n_actual in round_jobs:
                 if not os.path.exists(round_clusters) or os.path.getsize(round_clusters) == 0:
                     failed.append(marker_name)
                     continue
@@ -1205,32 +1364,35 @@ def cluster_markers_via_mqsub(
                             }
                         s = new_rep_stats[rep_seq]
                         if member_seq in old_rep_stats:
-                            # Member was a previous round's rep: merge accumulated stats.
                             ms = old_rep_stats[member_seq]
                             s["n_seqs"]     += ms["n_seqs"]
                             s["n_query"]    += ms["n_query"]
                             s["max_hits"]    = max(s["max_hits"], ms["max_hits"])
                             s["total_hits"] += ms["total_hits"]
                         else:
-                            # Member is a new sequence from this chunk.
                             unk, hits, n_occ, sum_hits_all = chunk_seq_to_stats.get(member_seq, (1, 0, 1, 0))
                             s["n_seqs"]     += n_occ
                             s["n_query"]    += (n_occ if unk == 0 else 0)
                             s["max_hits"]    = max(s["max_hits"], hits)
                             s["total_hits"] += sum_hits_all
 
-                marker_rep_stats[marker_name] = new_rep_stats
+                marker_rep_stats[marker_name]          = new_rep_stats
                 marker_current_reps_fasta[marker_name] = round_reps
+                marker_seqs_consumed[marker_name]      += n_actual
                 logging.info(
-                    f"[{marker_name}] After round {chunk_idx + 1}: "
-                    f"{len(new_rep_stats)} cluster(s)."
+                    f"[{marker_name}] After round {round_idx + 1}: "
+                    f"{len(new_rep_stats)} cluster(s), "
+                    f"{marker_seqs_consumed[marker_name]}/{marker_total_seqs[marker_name]} seq(s) done."
                 )
 
             if failed:
                 raise RuntimeError(
-                    f"{len(failed)} smafa chunk job(s) failed in round {chunk_idx + 1}:\n"
+                    f"{len(failed)} smafa chunk job(s) failed in round {round_idx + 1}:\n"
                     + "\n".join(f"  {m}" for m in sorted(failed))
                 )
+
+            round_idx += 1
+
 
         # ------------------------------------------------------------------
         # Phase C: write representatives.fasta per marker from accumulated stats.
@@ -1318,7 +1480,7 @@ def cluster_markers_via_mqsub(
 # ---------------------------------------------------------------------------
 
 def _mqwait(mqsub_log):
-    """Wait for all job IDs parsed from mqsub stdout."""
+    """Wait for all job IDs parsed from mqsub stdout. Returns list of job ID strings."""
     r = re.compile(r'^qsub stdout: (\d+\.aqua)$')
     job_ids = []
     for line in mqsub_log.split('\n'):
@@ -1327,11 +1489,54 @@ def _mqwait(mqsub_log):
             job_ids.append(m.group(1))
     logging.info(f"Waiting for {len(job_ids)} job(s) to finish ...")
     if not job_ids:
-        return
+        return job_ids
     with tempfile.NamedTemporaryFile(mode="w", prefix="mqwait_", suffix=".ids") as f:
         f.write('\n'.join(job_ids) + '\n')
         f.flush()
         extern.run(f"mqwait -i {f.name}")
+    return job_ids
+
+
+def _parse_walltimes_from_job_ids(job_ids):
+    """
+    Given a list of PBS job IDs (e.g. ['21290083.aqua', ...]), locate each
+    job's .OU file via `qstat -fx <jobid>` and parse the Wall time field.
+    Returns a list of wall-clock times in minutes.
+    """
+    import subprocess
+    walltimes = []
+    for job_id in job_ids:
+        try:
+            result = subprocess.run(
+                ["qstat", "-fx", job_id],
+                capture_output=True, text=True, timeout=30,
+            )
+            # Extract Output_Path (may be line-wrapped with a tab continuation).
+            output = result.stdout.replace('\n\t', '').replace('\t', '')
+            ou_dir = None
+            for line in output.splitlines():
+                if 'Output_Path' in line and ':' in line:
+                    ou_dir = line.split(':', 1)[1].strip()
+                    break
+            if ou_dir is None:
+                continue
+            import glob
+            for ou_file in glob.glob(ou_dir + '/*.OU'):
+                try:
+                    with open(ou_file) as fh:
+                        for line in fh:
+                            if 'Wall time' in line and ':' in line:
+                                time_part = line.split(': ', 1)[1].strip()
+                                parts = time_part.split(':')
+                                if len(parts) == 3:
+                                    h, m, s = int(parts[0]), int(parts[1]), int(parts[2])
+                                    walltimes.append(h * 60 + m + s / 60)
+                                    break
+                except OSError:
+                    pass
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+    return walltimes
 
 
 # ---------------------------------------------------------------------------
@@ -1488,6 +1693,7 @@ def collate_and_cluster(
             cluster_memory=cluster_memory,
             cluster_threads=cluster_threads,
             chunk_size=chunk_size,
+            target_walltime_hours=args.target_walltime_hours,
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
@@ -1619,7 +1825,17 @@ if __name__ == "__main__":
         type=int,
         default=2000000,
         metavar="N",
-        help="Number of sequences per smafa clustering chunk (default: 2000000)",
+        help="Max sequences per smafa chunk for round 0 (default: 2000000). "
+             "Subsequent rounds are sized adaptively by --target-walltime-hours.",
+    )
+
+    parser.add_argument(
+        "--target-walltime-hours",
+        type=float,
+        default=24.0,
+        metavar="H",
+        help="Target per-job walltime in hours; chunk size is adapted each round "
+             "to hit this target (default: 24.0).",
     )
 
     # --- Internal: used only when this script is re-invoked by an mqsub worker ---
