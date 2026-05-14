@@ -179,14 +179,115 @@ def otus_to_fasta(otus):
 # ---------------------------------------------------------------------------
 
 def _parse_header_stats(header):
-    """Extract (unknown_rank, hits) from a FASTA header written by otus_to_fasta."""
+    """Extract (unknown_rank, hits, n_occurrences, sum_hits) from a FASTA header.
+
+    n_occurrences and sum_hits are written by _dedup_fasta_with_counts; for
+    original per-sample headers they default to 1 and hits respectively.
+    """
     try:
         parts = header.lstrip(">").split("|")
         unknown_rank = int(next((p.split("=")[1] for p in parts if p.startswith("unknown=")), "1"))
         hits = int(next((p.split("=")[1] for p in parts if p.startswith("hits=")), "0"))
+        n_occurrences = int(next((p.split("=")[1] for p in parts if p.startswith("n_occurrences=")), "1"))
+        sum_hits = int(next((p.split("=")[1] for p in parts if p.startswith("sum_hits=")), str(hits)))
     except (ValueError, IndexError):
-        unknown_rank, hits = 1, 0
-    return unknown_rank, hits
+        unknown_rank, hits, n_occurrences, sum_hits = 1, 0, 1, 0
+    return unknown_rank, hits, n_occurrences, sum_hits
+
+
+def _dedup_fasta_with_counts(collated_path, dedup_path):
+    """
+    Deduplicate a large FASTA by sequence, aggregating occurrence counts and
+    summed hits across all occurrences.  Uses disk-based sort (GNU sort) to
+    keep orchestrator memory at O(1) regardless of input size.
+
+    Writes a deduplicated FASTA where each header encodes:
+      |unknown={min_unknown}|hits={max_hits}|n_occurrences={count}|sum_hits={sum}
+
+    _parse_header_stats reads these fields back so that cluster_size and
+    total_hits in the final representatives.fasta reflect the full dataset.
+    """
+    tmp_tsv    = dedup_path + ".counts_tmp.tsv"
+    tmp_sorted = dedup_path + ".counts_sorted.tsv"
+    try:
+        # Pass 1: stream FASTA → write seq TAB hits TAB unknown_rank (O(1) memory).
+        logging.info(f"Building sequence-counts TSV ...")
+        with open(collated_path) as in_fh, open(tmp_tsv, "w") as out_fh:
+            cur_hdr  = None
+            seq_parts = []
+            for line in in_fh:
+                line = line.rstrip("\n")
+                if line.startswith(">"):
+                    if cur_hdr is not None and seq_parts:
+                        seq = "".join(seq_parts)
+                        unk, hits, _, _ = _parse_header_stats(cur_hdr)
+                        out_fh.write(f"{seq}\t{hits}\t{unk}\n")
+                    cur_hdr   = line
+                    seq_parts = []
+                else:
+                    seq_parts.append(line)
+            if cur_hdr is not None and seq_parts:
+                seq = "".join(seq_parts)
+                unk, hits, _, _ = _parse_header_stats(cur_hdr)
+                out_fh.write(f"{seq}\t{hits}\t{unk}\n")
+
+        # Sort by sequence (GNU sort: disk-based merge sort, ~1 GB RAM buffer).
+        logging.info(f"Sorting sequence-counts TSV ...")
+        import subprocess
+        subprocess.run(
+            ["sort", "-k1,1", "--buffer-size=1G", tmp_tsv, "-o", tmp_sorted],
+            check=True,
+        )
+
+        # Pass 2: stream sorted TSV → aggregate → write deduplicated FASTA.
+        logging.info(f"Aggregating counts and writing deduplicated FASTA ...")
+        seq_num      = 0
+        cur_seq      = None
+        count        = 0
+        sum_hits     = 0
+        min_unknown  = 1
+        max_hits_cur = 0
+
+        def _flush_seq(out_fh):
+            nonlocal seq_num
+            if cur_seq is None:
+                return
+            out_fh.write(
+                f">seq{seq_num}"
+                f"|unknown={min_unknown}"
+                f"|hits={max_hits_cur}"
+                f"|n_occurrences={count}"
+                f"|sum_hits={sum_hits}\n{cur_seq}\n"
+            )
+            seq_num += 1
+
+        with open(tmp_sorted) as in_fh, open(dedup_path, "w") as out_fh:
+            for line in in_fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 3:
+                    continue
+                seq, hits_str, unk_str = parts[0], parts[1], parts[2]
+                hits = int(hits_str)
+                unk  = int(unk_str)
+                if seq == cur_seq:
+                    count       += 1
+                    sum_hits    += hits
+                    min_unknown  = min(min_unknown, unk)
+                    max_hits_cur = max(max_hits_cur, hits)
+                else:
+                    _flush_seq(out_fh)
+                    cur_seq      = seq
+                    count        = 1
+                    sum_hits     = hits
+                    min_unknown  = unk
+                    max_hits_cur = hits
+            _flush_seq(out_fh)
+
+        logging.info(f"Deduplicated FASTA written with {seq_num} unique sequence(s).")
+    finally:
+        for f in [tmp_tsv, tmp_sorted]:
+            if os.path.exists(f):
+                os.unlink(f)
 
 
 def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=1):
@@ -292,10 +393,11 @@ def _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, mark
 
     rep_fasta_lines = []
     for rep_seq, members in rep_to_all_members.items():
-        n_seqs = len(members)
-        n_query = sum(1 for m in members if seq_to_stats.get(m, (1, 0))[0] == 0)
-        max_hits = max((seq_to_stats.get(m, (1, 0))[1] for m in members), default=0)
-        total_hits = sum(seq_to_stats.get(m, (1, 0))[1] for m in members)
+        n_seqs = sum(seq_to_stats.get(m, (1, 0, 1, 0))[2] for m in members)
+        n_query = sum(seq_to_stats.get(m, (1, 0, 1, 0))[2] for m in members
+                      if seq_to_stats.get(m, (1, 0, 1, 0))[0] == 0)
+        max_hits = max((seq_to_stats.get(m, (1, 0, 1, 0))[1] for m in members), default=0)
+        total_hits = sum(seq_to_stats.get(m, (1, 0, 1, 0))[3] for m in members)
         orig_header = seq_to_header.get(rep_seq)
         if orig_header is None:
             logging.warning(f"[{marker_name}] Rep sequence not found in FASTA — skipping.")
@@ -442,11 +544,11 @@ def _process_cluster_file(fasta_path, cluster_path, marker_name):
             if rep_seq not in rep_stats:
                 rep_stats[rep_seq] = {"n_seqs": 0, "n_query": 0, "max_hits": 0, "total_hits": 0}
             s = rep_stats[rep_seq]
-            s["n_seqs"] += 1
-            unk, hits = seq_to_stats.get(member_seq, (1, 0))
-            s["n_query"] += 1 if unk == 0 else 0
+            unk, hits, n_occ, sum_hits_all = seq_to_stats.get(member_seq, (1, 0, 1, 0))
+            s["n_seqs"] += n_occ
+            s["n_query"] += n_occ if unk == 0 else 0
             s["max_hits"] = max(s["max_hits"], hits)
-            s["total_hits"] += hits
+            s["total_hits"] += sum_hits_all
 
     # Build enriched rep FASTA.
     rep_fasta_lines = []
@@ -933,10 +1035,24 @@ def cluster_markers_via_mqsub(
                     f"[{marker_name}] Resuming — found {len(existing)} existing chunk file(s)."
                 )
             else:
+                # Deduplicate by sequence before splitting (keeps first header per unique seq).
+                marker_dir = os.path.join(abs_output_dir, marker_name)
+                os.makedirs(marker_dir, exist_ok=True)
+                dedup_path = os.path.join(marker_dir, "deduplicated.fasta")
+                if not os.path.exists(dedup_path) or os.path.getsize(dedup_path) == 0:
+                    logging.info(
+                        f"[{marker_name}] Deduplicating collated FASTA (aggregating counts) ..."
+                    )
+                    _dedup_fasta_with_counts(fasta_path, dedup_path)
+                    logging.info(f"[{marker_name}] Deduplication complete.")
+                else:
+                    logging.info(
+                        f"[{marker_name}] Deduplicated FASTA already exists — skipping."
+                    )
                 logging.info(
-                    f"[{marker_name}] Splitting collated FASTA into chunk(s) of {chunk_size} ..."
+                    f"[{marker_name}] Splitting deduplicated FASTA into chunk(s) of {chunk_size} ..."
                 )
-                n = _split_fasta_to_chunk_files(fasta_path, chunk_dir, chunk_size)
+                n = _split_fasta_to_chunk_files(dedup_path, chunk_dir, chunk_size)
                 n_chunks_per_marker[marker_name] = n
                 logging.info(f"[{marker_name}] Split into {n} chunk(s).")
 
@@ -1065,11 +1181,11 @@ def cluster_markers_via_mqsub(
                             s["total_hits"] += ms["total_hits"]
                         else:
                             # Member is a new sequence from this chunk.
-                            unk, hits = chunk_seq_to_stats.get(member_seq, (1, 0))
-                            s["n_seqs"]     += 1
-                            s["n_query"]    += (1 if unk == 0 else 0)
+                            unk, hits, n_occ, sum_hits_all = chunk_seq_to_stats.get(member_seq, (1, 0, 1, 0))
+                            s["n_seqs"]     += n_occ
+                            s["n_query"]    += (n_occ if unk == 0 else 0)
                             s["max_hits"]    = max(s["max_hits"], hits)
-                            s["total_hits"] += hits
+                            s["total_hits"] += sum_hits_all
 
                 marker_rep_stats[marker_name] = new_rep_stats
                 marker_current_reps_fasta[marker_name] = round_reps
