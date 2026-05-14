@@ -201,19 +201,27 @@ def _dedup_fasta_with_counts(collated_path, dedup_path):
     summed hits across all occurrences.  Uses disk-based sort (GNU sort) to
     keep orchestrator memory at O(1) regardless of input size.
 
+    Output sequences are in the same order as their FIRST occurrence in the
+    collated FASTA (original sort-by-taxonomy/hits order is preserved), which
+    is important because smafa's greedy algorithm is order-dependent.
+
     Writes a deduplicated FASTA where each header encodes:
       |unknown={min_unknown}|hits={max_hits}|n_occurrences={count}|sum_hits={sum}
 
     _parse_header_stats reads these fields back so that cluster_size and
     total_hits in the final representatives.fasta reflect the full dataset.
     """
-    tmp_tsv    = dedup_path + ".counts_tmp.tsv"
-    tmp_sorted = dedup_path + ".counts_sorted.tsv"
+    import subprocess
+    tmp_tsv         = dedup_path + ".counts_tmp.tsv"
+    tmp_seq_sorted  = dedup_path + ".counts_seq_sorted.tsv"
+    tmp_agg         = dedup_path + ".counts_agg.tsv"
+    tmp_pos_sorted  = dedup_path + ".counts_pos_sorted.tsv"
     try:
-        # Pass 1: stream FASTA → write seq TAB hits TAB unknown_rank (O(1) memory).
-        logging.info(f"Building sequence-counts TSV ...")
+        # Pass 1: stream FASTA → write pos TAB seq TAB hits TAB unknown_rank (O(1) memory).
+        logging.info("Building sequence-counts TSV ...")
+        pos = 0
         with open(collated_path) as in_fh, open(tmp_tsv, "w") as out_fh:
-            cur_hdr  = None
+            cur_hdr   = None
             seq_parts = []
             for line in in_fh:
                 line = line.rstrip("\n")
@@ -221,7 +229,8 @@ def _dedup_fasta_with_counts(collated_path, dedup_path):
                     if cur_hdr is not None and seq_parts:
                         seq = "".join(seq_parts)
                         unk, hits, _, _ = _parse_header_stats(cur_hdr)
-                        out_fh.write(f"{seq}\t{hits}\t{unk}\n")
+                        out_fh.write(f"{pos}\t{seq}\t{hits}\t{unk}\n")
+                        pos += 1
                     cur_hdr   = line
                     seq_parts = []
                 else:
@@ -229,63 +238,86 @@ def _dedup_fasta_with_counts(collated_path, dedup_path):
             if cur_hdr is not None and seq_parts:
                 seq = "".join(seq_parts)
                 unk, hits, _, _ = _parse_header_stats(cur_hdr)
-                out_fh.write(f"{seq}\t{hits}\t{unk}\n")
+                out_fh.write(f"{pos}\t{seq}\t{hits}\t{unk}\n")
 
-        # Sort by sequence (GNU sort: disk-based merge sort, ~1 GB RAM buffer).
-        logging.info(f"Sorting sequence-counts TSV ...")
-        import subprocess
+        # Sort by sequence to group identical sequences for aggregation.
+        logging.info("Sorting by sequence for aggregation ...")
         subprocess.run(
-            ["sort", "-k1,1", "--buffer-size=1G", tmp_tsv, "-o", tmp_sorted],
+            ["sort", "-k2,2", "--buffer-size=1G", tmp_tsv, "-o", tmp_seq_sorted],
             check=True,
         )
 
-        # Pass 2: stream sorted TSV → aggregate → write deduplicated FASTA.
-        logging.info(f"Aggregating counts and writing deduplicated FASTA ...")
-        seq_num      = 0
+        # Pass 2: aggregate counts per unique sequence; retain the minimum position
+        # (= first occurrence) so we can restore original order afterwards.
+        logging.info("Aggregating counts ...")
         cur_seq      = None
+        first_pos    = None
         count        = 0
         sum_hits     = 0
         min_unknown  = 1
         max_hits_cur = 0
 
-        def _flush_seq(out_fh):
-            nonlocal seq_num
-            if cur_seq is None:
-                return
-            out_fh.write(
-                f">seq{seq_num}"
-                f"|unknown={min_unknown}"
-                f"|hits={max_hits_cur}"
-                f"|n_occurrences={count}"
-                f"|sum_hits={sum_hits}\n{cur_seq}\n"
-            )
-            seq_num += 1
+        with open(tmp_seq_sorted) as in_fh, open(tmp_agg, "w") as out_fh:
+            def _flush_agg(out_fh):
+                if cur_seq is None:
+                    return
+                out_fh.write(
+                    f"{first_pos}\t{cur_seq}\t{min_unknown}\t{max_hits_cur}"
+                    f"\t{count}\t{sum_hits}\n"
+                )
 
-        with open(tmp_sorted) as in_fh, open(dedup_path, "w") as out_fh:
             for line in in_fh:
                 parts = line.rstrip("\n").split("\t")
-                if len(parts) < 3:
+                if len(parts) < 4:
                     continue
-                seq, hits_str, unk_str = parts[0], parts[1], parts[2]
+                pos_str, seq, hits_str, unk_str = parts[0], parts[1], parts[2], parts[3]
+                pos  = int(pos_str)
                 hits = int(hits_str)
                 unk  = int(unk_str)
                 if seq == cur_seq:
-                    count       += 1
-                    sum_hits    += hits
-                    min_unknown  = min(min_unknown, unk)
-                    max_hits_cur = max(max_hits_cur, hits)
+                    count        += 1
+                    sum_hits     += hits
+                    min_unknown   = min(min_unknown, unk)
+                    max_hits_cur  = max(max_hits_cur, hits)
+                    first_pos     = min(first_pos, pos)
                 else:
-                    _flush_seq(out_fh)
-                    cur_seq      = seq
-                    count        = 1
-                    sum_hits     = hits
-                    min_unknown  = unk
-                    max_hits_cur = hits
-            _flush_seq(out_fh)
+                    _flush_agg(out_fh)
+                    cur_seq       = seq
+                    first_pos     = pos
+                    count         = 1
+                    sum_hits      = hits
+                    min_unknown   = unk
+                    max_hits_cur  = hits
+            _flush_agg(out_fh)
+
+        # Sort aggregated rows by first_pos to restore original input order.
+        logging.info("Restoring original sequence order ...")
+        subprocess.run(
+            ["sort", "-k1,1n", "--buffer-size=1G", tmp_agg, "-o", tmp_pos_sorted],
+            check=True,
+        )
+
+        # Pass 3: write deduplicated FASTA in original order.
+        logging.info("Writing deduplicated FASTA ...")
+        seq_num = 0
+        with open(tmp_pos_sorted) as in_fh, open(dedup_path, "w") as out_fh:
+            for line in in_fh:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) < 6:
+                    continue
+                _, seq, min_unk, max_hits, n_occ, s_hits = parts
+                out_fh.write(
+                    f">seq{seq_num}"
+                    f"|unknown={min_unk}"
+                    f"|hits={max_hits}"
+                    f"|n_occurrences={n_occ}"
+                    f"|sum_hits={s_hits}\n{seq}\n"
+                )
+                seq_num += 1
 
         logging.info(f"Deduplicated FASTA written with {seq_num} unique sequence(s).")
     finally:
-        for f in [tmp_tsv, tmp_sorted]:
+        for f in [tmp_tsv, tmp_seq_sorted, tmp_agg, tmp_pos_sorted]:
             if os.path.exists(f):
                 os.unlink(f)
 
