@@ -313,7 +313,7 @@ def _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, mark
     return cluster_tsv, rep_fasta
 
 
-def _cluster_marker_file_chunked(fasta_path, max_divergence, marker_name, chunk_size=10000, threads=16):
+def _cluster_marker_file_chunked(fasta_path, max_divergence, marker_name, chunk_size=2000000, threads=16):
     """
     Cluster sequences in sequential greedy chunks (local path, no mqsub).
 
@@ -728,7 +728,7 @@ def _header_sort_key(header):
 # Phase 2: cluster locally (multiprocessing across markers)
 # ---------------------------------------------------------------------------
 
-def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads, chunk_size=10000, cluster_threads=16):
+def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads, chunk_size=2000000, cluster_threads=16):
     """Run smafa cluster for each marker in parallel (file-based, no fasta_str)."""
 
     def _cluster_one(args_tuple):
@@ -883,7 +883,7 @@ def _already_clustered(output_dir, marker_name):
 
 def cluster_markers_via_mqsub(
     marker_to_fasta, output_dir, max_divergence, this_script_path, cluster_memory=64,
-    cluster_threads=16, chunk_size=10000,
+    cluster_threads=16, chunk_size=2000000,
 ):
     """
     Submit smafa cluster jobs via mqsub, one job per (marker, chunk) pair.
@@ -1263,7 +1263,7 @@ def worker_cluster_chunk(input_fasta, output_clusters_tsv, output_reps_fasta, ma
                     out_fh.write(cur_hdr + "\n" + seq + "\n")
 
 
-def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence, chunk_size=10000, cluster_threads=16):
+def worker_cluster_marker(fasta_path, marker_name, output_dir, max_divergence, chunk_size=2000000, cluster_threads=16):
     """Entry point for per-marker smafa cluster mqsub jobs (file-based, no fasta_str)."""
     if not os.path.exists(fasta_path) or os.path.getsize(fasta_path) == 0:
         logging.warning(f"[{marker_name}] Empty or missing FASTA — skipping.")
@@ -1296,7 +1296,7 @@ def collate_and_cluster(
     this_script_path,
     cluster_memory=64,
     cluster_threads=16,
-    chunk_size=10000,
+    chunk_size=2000000,
 ):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -1469,9 +1469,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=10000,
+        default=2000000,
         metavar="N",
-        help="Number of sequences per smafa clustering chunk (default: 10000)",
+        help="Number of sequences per smafa clustering chunk (default: 2000000)",
     )
 
     # --- Internal: used only when this script is re-invoked by an mqsub worker ---
@@ -1482,7 +1482,7 @@ if __name__ == "__main__":
     # Kept for backward-compat with any running jobs; not used by new orchestrator
     parser.add_argument("--_cluster-marker-fasta", metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--_marker-name", metavar="NAME", help=argparse.SUPPRESS)
-    parser.add_argument("--_chunk-size", type=int, default=10000, help=argparse.SUPPRESS)
+    parser.add_argument("--_chunk-size", type=int, default=2000000, help=argparse.SUPPRESS)
     # Per-sample extraction worker args
     parser.add_argument("--_extract-sample-archive", metavar="FILE", help=argparse.SUPPRESS)
     parser.add_argument("--_marker-domains-tsv", metavar="FILE", help=argparse.SUPPRESS)
