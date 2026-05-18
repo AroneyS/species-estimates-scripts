@@ -1045,20 +1045,43 @@ def _write_chunk_at_offset(dedup_path, seq_start, n_seqs, out_path):
     return written
 
 
+def _cluster_file_is_complete(round_clusters, round_input):
+    """Return True iff round_clusters has exactly as many lines as round_input has sequences."""
+    if not os.path.exists(round_clusters) or not os.path.exists(round_input):
+        return False
+    r_c = subprocess.run(["wc", "-l", round_clusters], capture_output=True, text=True)
+    r_i = subprocess.run(["grep", "-c", "^>", round_input], capture_output=True, text=True)
+    if r_c.returncode != 0 or r_i.returncode not in (0, 1):
+        return False
+    try:
+        n_cluster_lines = int(r_c.stdout.split()[0])
+        n_input_seqs    = int(r_i.stdout.strip())
+        return n_cluster_lines == n_input_seqs and n_cluster_lines > 0
+    except (ValueError, IndexError):
+        return False
+
+
 def _adaptive_chunk_size(model_b, model_c, R_k, target_min, seqs_remaining):
     """
     Solve b*n^2 + c*R_k*n = target_min for n.
     Falls back to seqs_remaining if model is not yet fitted.
+    When c is unknown but R_k > 0, uses a conservative c estimate (4 * model_b)
+    so the first cross-comparison round does not wildly overshoot the target.
     """
     if model_b is None:
         return seqs_remaining
-    if model_c is None or R_k == 0:
-        # Only quadratic term: n = sqrt(target / b)
+    if R_k == 0:
+        # No cross-comparison; pure quadratic.
         n = int((target_min / model_b) ** 0.5)
-    else:
-        # Quadratic formula: b*n^2 + c*R_k*n - target = 0
+    elif model_c is not None:
+        # Full model.
         disc = (model_c * R_k) ** 2 + 4 * model_b * target_min
         n = int((-model_c * R_k + disc ** 0.5) / (2 * model_b))
+    else:
+        # c unknown but cross-comparison exists — use conservative c = 4 * b.
+        c_est = model_b * 4
+        disc  = (c_est * R_k) ** 2 + 4 * model_b * target_min
+        n     = int((-c_est * R_k + disc ** 0.5) / (2 * model_b))
     return max(1, min(n, seqs_remaining))
 
 
@@ -1152,7 +1175,13 @@ def cluster_markers_via_mqsub(
                     initial_chunk  = os.path.join(chunk_dir, f"round_{ridx:04d}_chunk.fasta")
                     round_clusters = os.path.join(chunk_dir, f"round_{ridx:04d}_clusters.tsv")
                     round_reps     = os.path.join(chunk_dir, f"round_{ridx:04d}_reps.fasta")
-                    if not (os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0):
+                    round_input_r  = os.path.join(chunk_dir, f"round_{ridx:04d}_input.fasta")
+                    if not _cluster_file_is_complete(round_clusters, round_input_r):
+                        if os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0:
+                            logging.warning(
+                                f"[{marker_name}] Replay round {ridx}: "
+                                f"partial cluster file — skipping (will be retried)."
+                            )
                         continue
                     if not os.path.exists(initial_chunk):
                         continue
@@ -1264,10 +1293,10 @@ def cluster_markers_via_mqsub(
             if not round_jobs:
                 break
 
-            # Submit only jobs whose cluster output doesn't exist yet.
+            # Submit only jobs whose cluster output is not already complete.
             jobs_to_submit = [
                 (mn, ic, ri, rc, rr) for (mn, ic, ri, rc, rr, _) in round_jobs
-                if not (os.path.exists(rc) and os.path.getsize(rc) > 0)
+                if not _cluster_file_is_complete(rc, ri)
             ]
 
             if jobs_to_submit:
@@ -1300,47 +1329,32 @@ def cluster_markers_via_mqsub(
                     logging.info(f"Running: {mqsub_cmd}")
                     mqsub_stdout = extern.run(mqsub_cmd)
                     job_ids = _mqwait(mqsub_stdout)
+                    # Build job_id → marker_name map (submission order matches return order).
+                    _marker_job_id = {mn: job_ids[i] for i, (mn, *_) in enumerate(jobs_to_submit)}
                 finally:
                     os.unlink(cmd_file_path)
+            else:
+                _marker_job_id = {}
 
-                logging.info(f"Round {round_idx + 1} mqsub jobs complete.")
-
-                # Update timing model from this round's .OU walltimes.
-                walltimes = _parse_walltimes_from_job_ids(job_ids)
-                if walltimes:
-                    wt_med = sorted(walltimes)[len(walltimes) // 2]
-                    # Compute median n_k and R_k for submitted jobs only.
-                    n_vals = [n for mn, _, _, _, _, n in round_jobs
-                               if any(mn == smn for smn, *_ in jobs_to_submit)]
-                    n_med  = sorted(n_vals)[len(n_vals) // 2] if n_vals else chunk_size
-                    R_vals = [len(marker_rep_stats[mn]) for mn, *_ in round_jobs
-                               if any(mn == smn for smn, *_ in jobs_to_submit)]
-                    R_med  = sorted(R_vals)[len(R_vals) // 2] if R_vals else 0
-                    if round_idx == 0:
-                        # Fit b from t0 = b * n²
-                        model_b = wt_med / (n_med ** 2) if n_med > 0 else None
-                        logging.info(
-                            f"Timing model: b={model_b:.3e} min/seq² "
-                            f"(from round 0 median {wt_med:.1f} min, n={n_med})"
-                        )
-                    elif model_b is not None and R_med > 0:
-                        # Fit c from t1 = b*n² + c*R*n  →  c = (t - b*n²) / (R*n)
-                        cross = wt_med - model_b * n_med ** 2
-                        if cross > 0:
-                            model_c = cross / (R_med * n_med)
-                            logging.info(
-                                f"Timing model: b={model_b:.3e}, c={model_c:.3e} min/rep/seq "
-                                f"(from round {round_idx + 1} median {wt_med:.1f} min, "
-                                f"n={n_med}, R={R_med})"
-                            )
-                    # Persist updated model so resuming runs inherit it.
-                    with open(model_file, "w") as _mf:
-                        json.dump({"model_b": model_b, "model_c": model_c}, _mf)
+            logging.info(f"Round {round_idx + 1} mqsub jobs complete.")
 
             # Propagate state: stream clusters.tsv to update per-cluster stats.
             failed = []
-            for marker_name, initial_chunk, _round_input, round_clusters, round_reps, n_actual in round_jobs:
-                if not os.path.exists(round_clusters) or os.path.getsize(round_clusters) == 0:
+            for marker_name, initial_chunk, round_input, round_clusters, round_reps, n_actual in round_jobs:
+                if not _cluster_file_is_complete(round_clusters, round_input):
+                    if os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0:
+                        logging.warning(
+                            f"[{marker_name}] Round {round_idx + 1}: cluster file is partial — "
+                            f"deleting and will retry with smaller chunk."
+                        )
+                        os.unlink(round_clusters)
+                        if os.path.exists(round_reps):
+                            os.unlink(round_reps)
+                    else:
+                        logging.warning(
+                            f"[{marker_name}] Round {round_idx + 1}: cluster file missing/empty — "
+                            f"will retry."
+                        )
                     failed.append(marker_name)
                     continue
 
@@ -1386,10 +1400,48 @@ def cluster_markers_via_mqsub(
                 )
 
             if failed:
-                raise RuntimeError(
-                    f"{len(failed)} smafa chunk job(s) failed in round {round_idx + 1}:\n"
-                    + "\n".join(f"  {m}" for m in sorted(failed))
+                logging.warning(
+                    f"{len(failed)} smafa chunk job(s) produced incomplete output in round "
+                    f"{round_idx + 1} — will retry next round: "
+                    + ", ".join(sorted(failed))
                 )
+
+            # Update timing model using walltimes only from jobs that succeeded.
+            successful_markers = set(mn for mn, *_ in round_jobs) - set(failed)
+            successful_job_ids = [
+                _marker_job_id[mn]
+                for mn in (mn for mn, *_ in jobs_to_submit if mn in _marker_job_id)
+                if mn in successful_markers
+            ]
+            walltimes = _parse_walltimes_from_job_ids(successful_job_ids)
+            if walltimes:
+                wt_med = sorted(walltimes)[len(walltimes) // 2]
+                n_vals = [n for mn, _, _, _, _, n in round_jobs if mn in successful_markers]
+                n_med  = sorted(n_vals)[len(n_vals) // 2] if n_vals else chunk_size
+                R_vals = [len(marker_rep_stats[mn]) for mn, *_ in round_jobs
+                          if mn in successful_markers]
+                R_med  = sorted(R_vals)[len(R_vals) // 2] if R_vals else 0
+                if round_idx == 0:
+                    # Fit b from t0 = b * n²
+                    model_b = wt_med / (n_med ** 2) if n_med > 0 else None
+                    logging.info(
+                        f"Timing model: b={model_b:.3e} min/seq² "
+                        f"(from round 0 median {wt_med:.1f} min, n={n_med}, "
+                        f"{len(walltimes)}/{len(round_jobs)} succeeded)"
+                    )
+                elif model_b is not None and R_med > 0:
+                    # Fit c from t1 = b*n² + c*R*n  →  c = (t - b*n²) / (R*n)
+                    cross = wt_med - model_b * n_med ** 2
+                    if cross > 0:
+                        model_c = cross / (R_med * n_med)
+                        logging.info(
+                            f"Timing model: b={model_b:.3e}, c={model_c:.3e} min/rep/seq "
+                            f"(from round {round_idx + 1} median {wt_med:.1f} min, "
+                            f"n={n_med}, R={R_med}, {len(walltimes)}/{len(round_jobs)} succeeded)"
+                        )
+                # Persist updated model so resuming runs inherit it.
+                with open(model_file, "w") as _mf:
+                    json.dump({"model_b": model_b, "model_c": model_c}, _mf)
 
             round_idx += 1
 
