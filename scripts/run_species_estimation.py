@@ -1045,20 +1045,91 @@ def _write_chunk_at_offset(dedup_path, seq_start, n_seqs, out_path):
     return written
 
 
-def _cluster_file_is_complete(round_clusters, round_input):
-    """Return True iff round_clusters has exactly as many lines as round_input has sequences."""
+def _cluster_file_status(round_clusters, round_input):
+    """
+    Returns:
+      'complete' — line count >= n_input_seqs and non-empty.
+      'partial'  — file exists and non-empty but fewer lines than expected.
+      'missing'  — file absent or empty.
+    """
     if not os.path.exists(round_clusters) or not os.path.exists(round_input):
-        return False
+        return 'missing'
     r_c = subprocess.run(["wc", "-l", round_clusters], capture_output=True, text=True)
     r_i = subprocess.run(["grep", "-c", "^>", round_input], capture_output=True, text=True)
     if r_c.returncode != 0 or r_i.returncode not in (0, 1):
-        return False
+        return 'missing'
     try:
         n_cluster_lines = int(r_c.stdout.split()[0])
         n_input_seqs    = int(r_i.stdout.strip())
-        return n_cluster_lines == n_input_seqs and n_cluster_lines > 0
     except (ValueError, IndexError):
-        return False
+        return 'missing'
+    if n_cluster_lines == 0:
+        return 'missing'
+    if n_cluster_lines >= n_input_seqs:
+        return 'complete'
+    return 'partial'
+
+
+def _rescue_partial_cluster(round_clusters, round_input, initial_chunk, round_reps):
+    """
+    Rescue a partial cluster file (e.g. from a PBS job killed at the walltime limit):
+      1. Strip the last (possibly truncated) line.
+      2. Rebuild round_reps from the stripped cluster file + round_input sequences.
+      3. Return the number of *new* sequences (from initial_chunk) that were rescued,
+         or 0 if the file is not salvageable.
+    """
+    r_c  = subprocess.run(["wc", "-l", round_clusters],  capture_output=True, text=True)
+    r_i  = subprocess.run(["grep", "-c", "^>", round_input],   capture_output=True, text=True)
+    r_ch = subprocess.run(["grep", "-c", "^>", initial_chunk], capture_output=True, text=True)
+    if r_c.returncode != 0 or r_i.returncode not in (0, 1) or r_ch.returncode not in (0, 1):
+        return 0
+    try:
+        n_cluster_lines = int(r_c.stdout.split()[0])
+        n_input_seqs    = int(r_i.stdout.strip())
+        n_chunk_seqs    = int(r_ch.stdout.strip())
+    except (ValueError, IndexError):
+        return 0
+    R_k = n_input_seqs - n_chunk_seqs   # prev-rep sequences at front of round_input
+    rescued_lines = n_cluster_lines - 1  # drop last (possibly truncated) line
+    if rescued_lines <= R_k:
+        return 0   # not even the reps were fully processed
+    # Overwrite cluster file with stripped version.
+    tmp = round_clusters + ".rescue_tmp"
+    ret = subprocess.run(
+        ["head", "-n", str(rescued_lines), round_clusters],
+        stdout=open(tmp, "wb"),
+    )
+    if ret.returncode != 0:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        return 0
+    os.replace(tmp, round_clusters)
+    # Rebuild reps.fasta from the stripped clusters + round_input.
+    centroid_seqs = set()
+    with open(round_clusters) as cf:
+        for line in cf:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2:
+                centroid_seqs.add(parts[1])
+    with open(round_reps, "w") as out_fh:
+        cur_hdr, seq_parts = None, []
+        with open(round_input) as fh:
+            for raw in fh:
+                ln = raw.rstrip("\n")
+                if ln.startswith(">"):
+                    if cur_hdr is not None and seq_parts:
+                        seq = "".join(seq_parts)
+                        if seq.replace("-", "N") in centroid_seqs:
+                            out_fh.write(cur_hdr + "\n" + seq + "\n")
+                    cur_hdr, seq_parts = ln, []
+                else:
+                    seq_parts.append(ln)
+        if cur_hdr is not None and seq_parts:
+            seq = "".join(seq_parts)
+            if seq.replace("-", "N") in centroid_seqs:
+                out_fh.write(cur_hdr + "\n" + seq + "\n")
+    n_rescued = rescued_lines - R_k
+    return n_rescued
 
 
 def _adaptive_chunk_size(model_b, model_c, R_k, target_min, seqs_remaining):
@@ -1176,13 +1247,26 @@ def cluster_markers_via_mqsub(
                     round_clusters = os.path.join(chunk_dir, f"round_{ridx:04d}_clusters.tsv")
                     round_reps     = os.path.join(chunk_dir, f"round_{ridx:04d}_reps.fasta")
                     round_input_r  = os.path.join(chunk_dir, f"round_{ridx:04d}_input.fasta")
-                    if not _cluster_file_is_complete(round_clusters, round_input_r):
-                        if os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0:
+                    status = _cluster_file_status(round_clusters, round_input_r)
+                    if status == 'missing':
+                        continue
+                    if status == 'partial':
+                        if not os.path.exists(initial_chunk):
+                            continue
+                        n_rescued = _rescue_partial_cluster(
+                            round_clusters, round_input_r, initial_chunk, round_reps
+                        )
+                        if n_rescued == 0:
                             logging.warning(
                                 f"[{marker_name}] Replay round {ridx}: "
-                                f"partial cluster file — skipping (will be retried)."
+                                f"partial cluster file, nothing rescuable — skipping."
                             )
-                        continue
+                            continue
+                        logging.info(
+                            f"[{marker_name}] Replay round {ridx}: "
+                            f"rescued {n_rescued} seq(s) from partial cluster file."
+                        )
+                        # n_actual overridden below to n_rescued
                     if not os.path.exists(initial_chunk):
                         continue
 
@@ -1215,6 +1299,14 @@ def cluster_markers_via_mqsub(
                                 s["total_hits"] += sum_hits_all
 
                     n_actual = sum(1 for ln in open(initial_chunk) if ln.startswith(">"))
+                    if status == 'partial':
+                        # Rescue trimmed the cluster file; recount actual lines as n_rescued.
+                        r_c2 = subprocess.run(["wc", "-l", round_clusters], capture_output=True, text=True)
+                        r_i2 = subprocess.run(["grep", "-c", "^>", round_input_r], capture_output=True, text=True)
+                        try:
+                            n_actual = int(r_c2.stdout.split()[0]) - (int(r_i2.stdout.strip()) - n_actual)
+                        except (ValueError, IndexError):
+                            pass
                     marker_rep_stats[marker_name]          = new_rep_stats
                     marker_current_reps_fasta[marker_name] = round_reps
                     marker_seqs_consumed[marker_name]      += n_actual
@@ -1293,10 +1385,10 @@ def cluster_markers_via_mqsub(
             if not round_jobs:
                 break
 
-            # Submit only jobs whose cluster output is not already complete.
+            # Submit only jobs whose cluster output is missing (partial files are rescued below).
             jobs_to_submit = [
                 (mn, ic, ri, rc, rr) for (mn, ic, ri, rc, rr, _) in round_jobs
-                if not _cluster_file_is_complete(rc, ri)
+                if _cluster_file_status(rc, ri) == 'missing'
             ]
 
             if jobs_to_submit:
@@ -1341,21 +1433,24 @@ def cluster_markers_via_mqsub(
             # Propagate state: stream clusters.tsv to update per-cluster stats.
             failed = []
             for marker_name, initial_chunk, round_input, round_clusters, round_reps, n_actual in round_jobs:
-                if not _cluster_file_is_complete(round_clusters, round_input):
-                    if os.path.exists(round_clusters) and os.path.getsize(round_clusters) > 0:
+                status = _cluster_file_status(round_clusters, round_input)
+                if status == 'partial':
+                    n_rescued = _rescue_partial_cluster(
+                        round_clusters, round_input, initial_chunk, round_reps
+                    )
+                    if n_rescued == 0:
                         logging.warning(
-                            f"[{marker_name}] Round {round_idx + 1}: cluster file is partial — "
-                            f"deleting and will retry with smaller chunk."
+                            f"[{marker_name}] Round {round_idx + 1}: cluster file partial, "
+                            f"nothing rescuable — will retry."
                         )
-                        os.unlink(round_clusters)
-                        if os.path.exists(round_reps):
-                            os.unlink(round_reps)
-                    else:
-                        logging.warning(
-                            f"[{marker_name}] Round {round_idx + 1}: cluster file missing/empty — "
-                            f"will retry."
-                        )
-                    failed.append(marker_name)
+                        failed.append(marker_name)
+                        continue
+                    logging.info(
+                        f"[{marker_name}] Round {round_idx + 1}: rescued {n_rescued}/{n_actual} "
+                        f"seq(s) from partial cluster file — remainder deferred to next round."
+                    )
+                    n_actual = n_rescued  # propagate only the rescued portion
+                elif status == 'missing':
                     continue
 
                 old_rep_stats = marker_rep_stats[marker_name]
