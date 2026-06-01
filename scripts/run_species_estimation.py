@@ -1045,6 +1045,28 @@ def _write_chunk_at_offset(dedup_path, seq_start, n_seqs, out_path):
     return written
 
 
+def _rep_stats_path(output_dir, marker_name, round_idx):
+    """Path for persisted rep-stats dict after completing round `round_idx`."""
+    chunk_dir = os.path.join(output_dir, marker_name, "chunks")
+    return os.path.join(chunk_dir, f"round_{round_idx:04d}_rep_stats.pkl")
+
+
+def _save_rep_stats(path, rep_stats):
+    """Atomically persist rep_stats dict to a pickle file."""
+    import pickle
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(rep_stats, f, protocol=4)
+    os.replace(tmp, path)
+
+
+def _load_rep_stats(path):
+    """Load a rep_stats dict from a pickle file."""
+    import pickle
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def _cluster_file_status(round_clusters, round_input):
     """
     Returns:
@@ -1213,8 +1235,10 @@ def cluster_markers_via_mqsub(
             marker_total_seqs[marker_name]  = n_unique
             logging.info(f"[{marker_name}] {n_unique} unique sequence(s) to cluster.")
 
-        # Per-marker in-memory state (only small stats dicts, no sequence strings).
-        marker_rep_stats          = {m: {} for m in pending}
+        # Per-marker lightweight tracking (no full stats dicts in memory simultaneously).
+        # marker_cluster_count tracks cluster counts; full stats are persisted to disk
+        # and loaded one marker at a time to keep peak memory to O(one_marker).
+        marker_cluster_count      = {m: 0 for m in pending}
         marker_current_reps_fasta = {m: None for m in pending}
 
         # Reconstruct how many sequences each marker has already consumed and
@@ -1240,82 +1264,115 @@ def cluster_markers_via_mqsub(
                 f"Resuming — replaying {max_existing_round + 1} completed round(s) "
                 f"to rebuild orchestrator state ..."
             )
-            for ridx in range(max_existing_round + 1):
-                for marker_name in list(pending.keys()):
-                    chunk_dir      = os.path.join(abs_output_dir, marker_name, "chunks")
-                    initial_chunk  = os.path.join(chunk_dir, f"round_{ridx:04d}_chunk.fasta")
-                    round_clusters = os.path.join(chunk_dir, f"round_{ridx:04d}_clusters.tsv")
-                    round_reps     = os.path.join(chunk_dir, f"round_{ridx:04d}_reps.fasta")
-                    round_input_r  = os.path.join(chunk_dir, f"round_{ridx:04d}_input.fasta")
-                    status = _cluster_file_status(round_clusters, round_input_r)
-                    if status == 'missing':
-                        continue
-                    if status == 'partial':
+            # Process one marker at a time (all rounds) so only one marker's
+            # rep-stats dict is in memory at once, reducing peak RAM dramatically.
+            for marker_name in list(pending.keys()):
+                persisted = _rep_stats_path(abs_output_dir, marker_name, max_existing_round)
+                if os.path.exists(persisted):
+                    # Fast path: load already-persisted stats from a previous run.
+                    local_rep_stats = _load_rep_stats(persisted)
+                    # Recover current_reps_fasta and seqs_consumed from disk files.
+                    chunk_dir = os.path.join(abs_output_dir, marker_name, "chunks")
+                    for ridx in range(max_existing_round + 1):
+                        round_reps    = os.path.join(chunk_dir, f"round_{ridx:04d}_reps.fasta")
+                        initial_chunk = os.path.join(chunk_dir, f"round_{ridx:04d}_chunk.fasta")
+                        round_input_r = os.path.join(chunk_dir, f"round_{ridx:04d}_input.fasta")
+                        round_clusters = os.path.join(chunk_dir, f"round_{ridx:04d}_clusters.tsv")
+                        if not os.path.exists(round_reps) or not os.path.exists(initial_chunk):
+                            continue
+                        status = _cluster_file_status(round_clusters, round_input_r)
+                        if status == 'missing':
+                            continue
+                        n_actual = sum(1 for ln in open(initial_chunk) if ln.startswith(">"))
+                        marker_current_reps_fasta[marker_name] = round_reps
+                        marker_seqs_consumed[marker_name] += n_actual
+                    logging.info(
+                        f"[{marker_name}] Loaded persisted stats "
+                        f"({len(local_rep_stats)} cluster(s))."
+                    )
+                else:
+                    # Replay all rounds for this marker before moving to next.
+                    local_rep_stats = {}
+                    chunk_dir = os.path.join(abs_output_dir, marker_name, "chunks")
+                    for ridx in range(max_existing_round + 1):
+                        initial_chunk  = os.path.join(chunk_dir, f"round_{ridx:04d}_chunk.fasta")
+                        round_clusters = os.path.join(chunk_dir, f"round_{ridx:04d}_clusters.tsv")
+                        round_reps     = os.path.join(chunk_dir, f"round_{ridx:04d}_reps.fasta")
+                        round_input_r  = os.path.join(chunk_dir, f"round_{ridx:04d}_input.fasta")
+                        status = _cluster_file_status(round_clusters, round_input_r)
+                        if status == 'missing':
+                            continue
+                        if status == 'partial':
+                            if not os.path.exists(initial_chunk):
+                                continue
+                            n_rescued = _rescue_partial_cluster(
+                                round_clusters, round_input_r, initial_chunk, round_reps
+                            )
+                            if n_rescued == 0:
+                                logging.warning(
+                                    f"[{marker_name}] Replay round {ridx}: "
+                                    f"partial cluster file, nothing rescuable — skipping."
+                                )
+                                continue
+                            logging.info(
+                                f"[{marker_name}] Replay round {ridx}: "
+                                f"rescued {n_rescued} seq(s) from partial cluster file."
+                            )
                         if not os.path.exists(initial_chunk):
                             continue
-                        n_rescued = _rescue_partial_cluster(
-                            round_clusters, round_input_r, initial_chunk, round_reps
-                        )
-                        if n_rescued == 0:
-                            logging.warning(
-                                f"[{marker_name}] Replay round {ridx}: "
-                                f"partial cluster file, nothing rescuable — skipping."
-                            )
-                            continue
-                        logging.info(
-                            f"[{marker_name}] Replay round {ridx}: "
-                            f"rescued {n_rescued} seq(s) from partial cluster file."
-                        )
-                        # n_actual overridden below to n_rescued
-                    if not os.path.exists(initial_chunk):
-                        continue
 
-                    old_rep_stats = marker_rep_stats[marker_name]
-                    chunk_seq_to_stats = _stream_chunk_seq_stats(initial_chunk)
-                    new_rep_stats = {}
-                    with open(round_clusters) as cf:
-                        for line in cf:
-                            parts = line.rstrip("\n").split("\t")
-                            if len(parts) < 2:
-                                continue
-                            member_seq, rep_seq = parts[0], parts[1]
-                            if rep_seq not in new_rep_stats:
-                                new_rep_stats[rep_seq] = {
-                                    "n_seqs": 0, "n_query": 0,
-                                    "max_hits": 0, "total_hits": 0,
-                                }
-                            s = new_rep_stats[rep_seq]
-                            if member_seq in old_rep_stats:
-                                ms = old_rep_stats[member_seq]
-                                s["n_seqs"]     += ms["n_seqs"]
-                                s["n_query"]    += ms["n_query"]
-                                s["max_hits"]    = max(s["max_hits"], ms["max_hits"])
-                                s["total_hits"] += ms["total_hits"]
-                            else:
-                                unk, hits, n_occ, sum_hits_all = chunk_seq_to_stats.get(member_seq, (1, 0, 1, 0))
-                                s["n_seqs"]     += n_occ
-                                s["n_query"]    += (n_occ if unk == 0 else 0)
-                                s["max_hits"]    = max(s["max_hits"], hits)
-                                s["total_hits"] += sum_hits_all
+                        old_rep_stats = local_rep_stats
+                        chunk_seq_to_stats = _stream_chunk_seq_stats(initial_chunk)
+                        new_rep_stats = {}
+                        with open(round_clusters) as cf:
+                            for line in cf:
+                                parts = line.rstrip("\n").split("\t")
+                                if len(parts) < 2:
+                                    continue
+                                member_seq, rep_seq = parts[0], parts[1]
+                                if rep_seq not in new_rep_stats:
+                                    new_rep_stats[rep_seq] = {
+                                        "n_seqs": 0, "n_query": 0,
+                                        "max_hits": 0, "total_hits": 0,
+                                    }
+                                s = new_rep_stats[rep_seq]
+                                if member_seq in old_rep_stats:
+                                    ms = old_rep_stats[member_seq]
+                                    s["n_seqs"]     += ms["n_seqs"]
+                                    s["n_query"]    += ms["n_query"]
+                                    s["max_hits"]    = max(s["max_hits"], ms["max_hits"])
+                                    s["total_hits"] += ms["total_hits"]
+                                else:
+                                    unk, hits, n_occ, sum_hits_all = chunk_seq_to_stats.get(member_seq, (1, 0, 1, 0))
+                                    s["n_seqs"]     += n_occ
+                                    s["n_query"]    += (n_occ if unk == 0 else 0)
+                                    s["max_hits"]    = max(s["max_hits"], hits)
+                                    s["total_hits"] += sum_hits_all
 
-                    n_actual = sum(1 for ln in open(initial_chunk) if ln.startswith(">"))
-                    if status == 'partial':
-                        # Rescue trimmed the cluster file; recount actual lines as n_rescued.
-                        r_c2 = subprocess.run(["wc", "-l", round_clusters], capture_output=True, text=True)
-                        r_i2 = subprocess.run(["grep", "-c", "^>", round_input_r], capture_output=True, text=True)
-                        try:
-                            n_actual = int(r_c2.stdout.split()[0]) - (int(r_i2.stdout.strip()) - n_actual)
-                        except (ValueError, IndexError):
-                            pass
-                    marker_rep_stats[marker_name]          = new_rep_stats
-                    marker_current_reps_fasta[marker_name] = round_reps
-                    marker_seqs_consumed[marker_name]      += n_actual
+                        del old_rep_stats, chunk_seq_to_stats  # free memory promptly
+                        n_actual = sum(1 for ln in open(initial_chunk) if ln.startswith(">"))
+                        if status == 'partial':
+                            r_c2 = subprocess.run(["wc", "-l", round_clusters], capture_output=True, text=True)
+                            r_i2 = subprocess.run(["grep", "-c", "^>", round_input_r], capture_output=True, text=True)
+                            try:
+                                n_actual = int(r_c2.stdout.split()[0]) - (int(r_i2.stdout.strip()) - n_actual)
+                            except (ValueError, IndexError):
+                                pass
+                        local_rep_stats = new_rep_stats
+                        del new_rep_stats  # keep only the latest round's stats
+                        marker_current_reps_fasta[marker_name] = round_reps
+                        marker_seqs_consumed[marker_name]      += n_actual
 
-            for marker_name in pending:
+                    # Persist to disk so future runs skip replay for this marker.
+                    if local_rep_stats:
+                        _save_rep_stats(persisted, local_rep_stats)
+
+                marker_cluster_count[marker_name] = len(local_rep_stats)
+                del local_rep_stats  # free: will be reloaded from disk when needed in Phase B
                 logging.info(
                     f"[{marker_name}] Resumed: {marker_seqs_consumed[marker_name]}/"
                     f"{marker_total_seqs[marker_name]} seq(s) consumed, "
-                    f"{len(marker_rep_stats[marker_name])} cluster(s)."
+                    f"{marker_cluster_count[marker_name]} cluster(s)."
                 )
 
         # Adaptive timing model (shared across markers; fitted from .OU walltimes).
@@ -1344,7 +1401,7 @@ def cluster_markers_via_mqsub(
                 if seqs_remaining <= 0:
                     continue
 
-                R_k   = len(marker_rep_stats[marker_name])
+                R_k   = marker_cluster_count[marker_name]
                 n_k   = _adaptive_chunk_size(model_b, model_c, R_k, target_min, seqs_remaining)
                 # For round 0, honour the user-supplied chunk_size as initial cap.
                 if round_idx == 0:
@@ -1453,7 +1510,13 @@ def cluster_markers_via_mqsub(
                 elif status == 'missing':
                     continue
 
-                old_rep_stats = marker_rep_stats[marker_name]
+                # Load this marker's accumulated stats from disk (only one marker
+                # in memory at a time to keep peak RAM at O(one_marker)).
+                prev_stats_path = _rep_stats_path(abs_output_dir, marker_name, round_idx - 1)
+                if os.path.exists(prev_stats_path):
+                    old_rep_stats = _load_rep_stats(prev_stats_path)
+                else:
+                    old_rep_stats = {}
 
                 # Stats for brand-new sequences in this chunk (O(chunk_size) memory).
                 chunk_seq_to_stats = _stream_chunk_seq_stats(initial_chunk)
@@ -1485,12 +1548,19 @@ def cluster_markers_via_mqsub(
                             s["max_hits"]    = max(s["max_hits"], hits)
                             s["total_hits"] += sum_hits_all
 
-                marker_rep_stats[marker_name]          = new_rep_stats
+                del old_rep_stats, chunk_seq_to_stats  # free before persisting
+
+                # Persist updated stats to disk; free from memory.
+                new_stats_path = _rep_stats_path(abs_output_dir, marker_name, round_idx)
+                _save_rep_stats(new_stats_path, new_rep_stats)
+                marker_cluster_count[marker_name]      = len(new_rep_stats)
+                del new_rep_stats
+
                 marker_current_reps_fasta[marker_name] = round_reps
                 marker_seqs_consumed[marker_name]      += n_actual
                 logging.info(
                     f"[{marker_name}] After round {round_idx + 1}: "
-                    f"{len(new_rep_stats)} cluster(s), "
+                    f"{marker_cluster_count[marker_name]} cluster(s), "
                     f"{marker_seqs_consumed[marker_name]}/{marker_total_seqs[marker_name]} seq(s) done."
                 )
 
@@ -1513,7 +1583,7 @@ def cluster_markers_via_mqsub(
                 wt_med = sorted(walltimes)[len(walltimes) // 2]
                 n_vals = [n for mn, _, _, _, _, n in round_jobs if mn in successful_markers]
                 n_med  = sorted(n_vals)[len(n_vals) // 2] if n_vals else chunk_size
-                R_vals = [len(marker_rep_stats[mn]) for mn, *_ in round_jobs
+                R_vals = [marker_cluster_count[mn] for mn, *_ in round_jobs
                           if mn in successful_markers]
                 R_med  = sorted(R_vals)[len(R_vals) // 2] if R_vals else 0
                 if round_idx == 0:
@@ -1546,11 +1616,20 @@ def cluster_markers_via_mqsub(
         # ------------------------------------------------------------------
         for marker_name in list(pending.keys()):
             fasta_path = pending[marker_name]
-            rep_stats  = marker_rep_stats[marker_name]
             reps_fasta = marker_current_reps_fasta[marker_name]
 
             marker_dir = os.path.join(abs_output_dir, marker_name)
             os.makedirs(marker_dir, exist_ok=True)
+
+            # Load this marker's accumulated stats from the latest persisted file.
+            chunk_dir = os.path.join(abs_output_dir, marker_name, "chunks")
+            stats_files = sorted(
+                f for f in os.listdir(chunk_dir) if f.endswith("_rep_stats.pkl")
+            ) if os.path.isdir(chunk_dir) else []
+            if not stats_files:
+                logging.warning(f"[{marker_name}] No persisted rep stats found — skipping.")
+                continue
+            rep_stats = _load_rep_stats(os.path.join(chunk_dir, stats_files[-1]))
 
             # Read the final round's reps.fasta to get original headers for each rep seq.
             rep_to_header = {}
@@ -1578,7 +1657,7 @@ def cluster_markers_via_mqsub(
                     orig_header = rep_to_header.get(rep_seq)
                     if orig_header is None:
                         logging.warning(
-                            f"[{marker_name}] Rep sequence not found in reps.fasta — skipping: {rep_seq}"
+                            f"[{marker_name}] Rep sequence not found in reps.fasta — skipping."
                         )
                         continue
                     enriched = (
@@ -1590,6 +1669,8 @@ def cluster_markers_via_mqsub(
                     )
                     out_fh.write(enriched + "\n" + rep_seq + "\n")
                     n_clusters += 1
+
+            del rep_stats  # free after writing
 
             n_otus = 0
             if os.path.exists(fasta_path):
