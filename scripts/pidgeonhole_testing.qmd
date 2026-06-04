@@ -111,7 +111,7 @@ query_only_benchmarks %>%
   pivot_wider(names_from = banding, values_from = s) %>%
   mutate(speed_up = `FALSE` / `TRUE`) %>%
   filter(!is.na(speed_up)) %>%
-  ggplot(aes(x = sample_size, y = speed_up)) +
+  ggplot(aes(x = num_otus, y = speed_up)) +
   geom_point() +
   geom_smooth(method = "lm") +
   theme_cowplot()
