@@ -164,8 +164,6 @@ rule singlem_renew_query_benchmark:
                 fh.write("{}\t{:.1f}\n".format(label, seconds))
 
 rule extract_sample_sizes:
-    input:
-        expand("results/singlem_renew/with_banding/{sample}.json", sample=RENEW_SAMPLES),
     output:
         "results/singlem_renew/sample_sizes.tsv",
     localrule: True
