@@ -169,7 +169,7 @@ rule extract_sample_sizes:
     localrule: True
     run:
         with open(output[0], "w") as fh:
-            fh.write("sample\tnumber_of_root_occurences\n")
+            fh.write("sample\tnum_otus\n")
             for sample in RENEW_SAMPLES:
                 path = RENEW_SAMPLE_TO_PATH[sample]
                 with open(path) as f:
