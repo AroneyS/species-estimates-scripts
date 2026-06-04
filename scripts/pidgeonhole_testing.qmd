@@ -1,0 +1,119 @@
+---
+title: "Pidgeonhole benchmarking"
+author: "Samuel Aroney"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+format:
+  html:
+    code-fold: true
+execute:
+  echo: False
+---
+
+```{r setup}
+#! include: false
+
+library(cowplot)
+library(tidyverse)
+library(here)
+
+output_dir <- here("results", "pidgeonhole_testing_qmd", "20260602")
+dir.create(output_dir, recursive = TRUE)
+
+# Colour Brewer paired palette
+colour_brewer <- setNames(append(as.list(RColorBrewer::brewer.pal(12, "Paired")), c("#737373", "#FFFFFF", "#000000")), c("blue", "darkblue", "green", "darkgreen", "red", "darkred", "orange", "darkorange", "purple", "darkpurple", "yellow", "brown", "grey", "white", "black"))
+
+# Paul Tol's vibrant palette - colourblind friendly
+vibrant_colours <- c("#CC3311", "#0077BB", "#009988", "#EE3377", "#EE7733", "#33BBEE")
+# Paul Tol's muted palette - plus 3 extras
+muted_colours <- c("#882255", "#332288", "#DDCC77", "#117733", "#88CCEE", "#CC6677", "#44AA99", "#999933", "#AA4499", "#BBBBBB", "#EE7733", "#CC3311")
+# Paul Tol's bright palette - colourblind friendly
+bright_colours <- c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+```
+
+```{r wrangling}
+input_dir <- here("results", "pidgeonhole_testing", "20260602")
+
+cluster_no_banding_dir <- here(input_dir, "benchmarks/pidgeonhole_testing/no_banding")
+cluster_with_banding_dir <- here(input_dir, "benchmarks/pidgeonhole_testing/with_banding")
+renew_no_banding_dir <- here(input_dir, "benchmarks/singlem_renew/no_banding")
+renew_with_banding_dir <- here(input_dir, "benchmarks/singlem_renew/with_banding")
+renew_query_only_dir <- here(input_dir, "benchmarks/singlem_renew_query")
+
+snakemake_benchmarks <- tibble(
+    dirs = c(cluster_no_banding_dir, cluster_with_banding_dir, renew_no_banding_dir, renew_with_banding_dir),
+    task = c("cluster", "cluster", "renew", "renew"),
+    banding = c(FALSE, TRUE, FALSE, TRUE),
+  ) %>%
+  mutate(
+    benchmarks = map(dirs, list.files),
+  ) %>%
+  unnest(benchmarks) %>%
+  mutate(
+    data = map2(dirs, benchmarks, ~ read_tsv(file.path(.x, .y), col_types = cols())),
+    sample = str_extract(benchmarks, ".*(?=\\.txt)")
+  ) %>%
+  unnest(data) %>%
+  select(-dirs, -benchmarks)
+
+sample_sizes <- read_tsv(here(input_dir, "results/singlem_renew/sample_sizes.tsv"))
+
+query_only_benchmarks <- tibble(
+    dirs = c(renew_query_only_dir),
+    task = c("renew_query_only"),
+  ) %>%
+  mutate(
+    benchmarks = map(dirs, list.files),
+  ) %>%
+  unnest(benchmarks) %>%
+  mutate(
+    data = map2(dirs, benchmarks, ~ read_tsv(file.path(.x, .y), col_types = cols(), col_names = c("metric", "value")) %>% pivot_wider(names_from = "metric", values_from = "value")),
+    sample = str_extract(benchmarks, ".*(?=\\.tsv)")
+  ) %>%
+  unnest(data) %>%
+  select(-dirs, -benchmarks) %>%
+  pivot_longer(-c(task, sample), names_to = "banding", values_to = "s") %>%
+  mutate(banding = banding == "with_banding") %>%
+  left_join(sample_sizes, by = "sample")
+```
+
+```{r stats}
+bind_rows(
+    snakemake_benchmarks %>%
+      select(task, sample, banding, s),
+    query_only_benchmarks
+  ) %>%
+  pivot_wider(names_from = banding, values_from = s) %>%
+  mutate(speed_up = `FALSE` / `TRUE`) %>%
+  group_by(task) %>%
+  summarise(
+    median_speed_up = median(speed_up, na.rm = TRUE),
+    mean_speed_up = mean(speed_up, na.rm = TRUE),
+    )
+```
+
+```{r analysis}
+snakemake_benchmarks %>%
+  ggplot(aes(x = banding, y = s)) +
+  geom_boxplot() +
+  facet_wrap(~ task) +
+  scale_x_discrete(labels = c("No banding", "With banding")) +
+  theme_cowplot()
+ggsave(here(output_dir, "snakemake_benchmarks.png"), width = 12, height = 10, dpi = 600)
+
+query_only_benchmarks %>%
+  ggplot(aes(x = banding, y = s)) +
+  geom_boxplot() +
+  scale_x_discrete(labels = c("No banding", "With banding")) +
+  theme_cowplot()
+ggsave(here(output_dir, "query_only_benchmarks.png"), width = 12, height = 10, dpi = 600)
+
+query_only_benchmarks %>%
+  pivot_wider(names_from = banding, values_from = s) %>%
+  mutate(speed_up = `FALSE` / `TRUE`) %>%
+  filter(!is.na(speed_up)) %>%
+  ggplot(aes(x = sample_size, y = speed_up)) +
+  geom_point() +
+  geom_smooth(method = "lm") +
+  theme_cowplot()
+ggsave(here(output_dir, "query_only_speed_up_vs_sample_size.png"), width = 12, height = 10, dpi = 600)
+```
