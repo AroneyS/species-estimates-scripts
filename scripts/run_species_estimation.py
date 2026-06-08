@@ -186,12 +186,14 @@ def _parse_header_stats(header):
     """
     try:
         parts = header.lstrip(">").split("|")
-        unknown_rank = int(next((p.split("=")[1] for p in parts if p.startswith("unknown=")), "1"))
-        hits = int(next((p.split("=")[1] for p in parts if p.startswith("hits=")), "0"))
+        unknown_rank = int(next((p.split("=")[1] for p in parts if p.startswith("unknown="))))
+        hits = int(next((p.split("=")[1] for p in parts if p.startswith("hits="))))
         n_occurrences = int(next((p.split("=")[1] for p in parts if p.startswith("n_occurrences=")), "1"))
         sum_hits = int(next((p.split("=")[1] for p in parts if p.startswith("sum_hits=")), str(hits)))
-    except (ValueError, IndexError):
-        unknown_rank, hits, n_occurrences, sum_hits = 1, 0, 1, 0
+    except (ValueError, IndexError, StopIteration):
+        logging.error(f"Failed to parse header stats from: {header}")
+        raise
+
     return unknown_rank, hits, n_occurrences, sum_hits
 
 
