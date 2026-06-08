@@ -1872,19 +1872,26 @@ def collate_and_cluster(
 
     if run_through_mqsub:
         # Phase 1: submit one extraction job per archive (skip already-done ones)
-        pending = [p for p in archive_paths if not _already_extracted(output_dir, p)]
-        skipped = len(archive_paths) - len(pending)
-        if skipped:
-            logging.info(f"Skipping {skipped} already-extracted archive(s).")
-        submit_extraction_jobs(
-            pending, marker_domains, markers_of_interest,
-            output_dir, this_script_path
-        )
+        phase_1_sentinel = os.path.join(output_dir, SAMPLE_FASTA_SUBDIR, "done")
+        if not os.path.exists(phase_1_sentinel):
+            pending = [p for p in archive_paths if not _already_extracted(output_dir, p)]
+            skipped = len(archive_paths) - len(pending)
+            if skipped:
+                logging.info(f"Skipping {skipped} already-extracted archive(s).")
+            submit_extraction_jobs(
+                pending, marker_domains, markers_of_interest,
+                output_dir, this_script_path
+            )
+            open(phase_1_sentinel, "w").close()
+        else:
+            logging.info("Skipping Phase 1 extraction -- already done.")
+
         # Phase 2: cat per-sample FASTAs into per-marker FASTAs (local, fast)
         marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads)
         if not marker_to_fasta:
             logging.warning("No markers with sequences -- nothing to cluster.")
             return
+
         # Phase 3: submit one smafa cluster job per (marker, round) pair via mqsub
         cluster_markers_via_mqsub(
             marker_to_fasta, output_dir, max_divergence, this_script_path,
@@ -1895,33 +1902,42 @@ def collate_and_cluster(
         )
     else:
         # Local path: extract all samples in parallel, then cluster in parallel
-        pending = [p for p in archive_paths if not _already_extracted(output_dir, p)]
-        skipped = len(archive_paths) - len(pending)
-        if skipped:
-            logging.info(f"Skipping {skipped} already-extracted archive(s).")
-        logging.info(
-            f"Extracting {len(pending)} archive(s) locally "
-            f"across {threads} thread(s) ..."
-        )
-        worker_args = [
-            (
-                archive_path,
-                marker_domains,
-                markers_of_interest,
-                _sample_fasta_dir(output_dir, archive_path),
+        # Phase 1: extract all samples in parallel (skip already-done ones)
+        phase_1_sentinel = os.path.join(output_dir, SAMPLE_FASTA_SUBDIR, "done")
+        if not os.path.exists(phase_1_sentinel):
+            pending = [p for p in archive_paths if not _already_extracted(output_dir, p)]
+            skipped = len(archive_paths) - len(pending)
+            if skipped:
+                logging.info(f"Skipping {skipped} already-extracted archive(s).")
+            logging.info(
+                f"Extracting {len(pending)} archive(s) locally "
+                f"across {threads} thread(s) ..."
             )
-            for archive_path in pending
-        ]
-        if threads > 1:
-            with Pool(threads) as pool:
-                pool.map(extract_sample_fastas_local_worker, worker_args)
+            worker_args = [
+                (
+                    archive_path,
+                    marker_domains,
+                    markers_of_interest,
+                    _sample_fasta_dir(output_dir, archive_path),
+                )
+                for archive_path in pending
+            ]
+            if threads > 1:
+                with Pool(threads) as pool:
+                    pool.map(extract_sample_fastas_local_worker, worker_args)
+            else:
+                list(map(extract_sample_fastas_local_worker, worker_args))
+            open(phase_1_sentinel, "w").close()
         else:
-            list(map(extract_sample_fastas_local_worker, worker_args))
+            logging.info("Skipping Phase 1 extraction -- already done.")
 
+        # Phase 2: cat per-sample FASTAs into per-marker FASTAs (local, fast)
         marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads)
         if not marker_to_fasta:
             logging.warning("No markers with sequences -- nothing to cluster.")
             return
+
+        # Phase 3: smafa cluster
         cluster_markers_locally(
             marker_to_fasta, output_dir, max_divergence, threads,
             chunk_size=chunk_size, cluster_threads=cluster_threads
