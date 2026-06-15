@@ -617,6 +617,60 @@ def _process_cluster_file(fasta_path, cluster_path, marker_name):
 
     return cluster_tsv, rep_fasta
 
+def _representatives_fasta_to_tsv(rep_fasta_path, tsv_path, marker_name):
+    """
+    Read a representatives.fasta and write a TSV summarising its headers.
+
+    Each FASTA header is of the form:
+        >{id}|{key1}={val1}|{key2}={val2}|...
+
+    e.g. (mqsub path)
+        >seq123|unknown=0|hits=5|n_occurrences=2|sum_hits=7|cluster_size=9|n_query=3|max_hits=5|total_hits=12
+    or (local path)
+        >otu0|sample1|gene1|unknown=0|hits=5|cluster_size=9|n_query=3|max_hits=5|total_hits=12
+
+    The leading '|'-separated tokens before the first 'key=value' token (i.e.
+    those without an '=') are written to a single 'id' column (joined by '|'
+    with the leading '>' stripped); each subsequent 'key=value' token becomes
+    its own column.  A 'marker' column with `marker_name` is also included.
+
+    Columns are the union of keys seen across all headers in this FASTA, so
+    the TSV is consistent even if some headers have extra/missing fields.
+    Does nothing (writes no file) if rep_fasta_path is missing or empty.
+    """
+    if not os.path.exists(rep_fasta_path) or os.path.getsize(rep_fasta_path) == 0:
+        logging.warning(f"[{marker_name}] No representatives.fasta found -- skipping headers TSV.")
+        return
+
+    seen_keys = []
+    header_done = False
+    with open(rep_fasta_path) as fh:
+        with open(tsv_path, "w") as out_fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line.startswith(">"):
+                    continue
+                tokens = line[1:].split("|")
+                id_parts = []
+                row = {}
+                for tok in tokens:
+                    if "=" in tok:
+                        key, _, val = tok.partition("=")
+                        row[key] = val
+                        if header_done and key not in seen_keys:
+                            raise ValueError(f"Unexpected new key '{key}' in header: {line}")
+                    else:
+                        id_parts.append(tok)
+
+                if not header_done:
+                    seen_keys.extend(row.keys())
+                    out_fh.write("\t".join(["id"] + seen_keys) + "\n")
+                    header_done = True
+
+                out_fh.write("\t".join(["|".join(id_parts)] + [row.get(k, "") for k in seen_keys]) + "\n")
+
+    logging.info(f"[{marker_name}] Converted representative header(s) to tsv.")
+
 
 # ---------------------------------------------------------------------------
 # Phase 1 (local): read one archive, filter, write per-marker FASTAs into a
@@ -900,6 +954,16 @@ def cluster_markers_locally(marker_to_fasta, output_dir, max_divergence, threads
             results = pool.map(_cluster_one, worker_args)
     else:
         results = list(map(_cluster_one, worker_args))
+
+    for marker_name, _ in marker_to_fasta.items():
+        marker_dir     = os.path.join(output_dir, marker_name)
+        rep_fasta_path = os.path.join(marker_dir, "representatives.fasta")
+
+        tsv_path = os.path.join(marker_dir, f"{marker_name}.tsv")
+        if not os.path.exists(tsv_path):
+            _representatives_fasta_to_tsv(
+                rep_fasta_path, tsv_path, marker_name
+            )
 
     summary_rows = _write_cluster_results(results, marker_to_fasta, output_dir)
     _write_summary(summary_rows, output_dir)
@@ -1580,6 +1644,13 @@ def cluster_markers_via_mqsub(
     for marker_name, fasta_path in marker_to_fasta.items():
         marker_dir     = os.path.join(abs_output_dir, marker_name)
         rep_fasta_path = os.path.join(marker_dir, "representatives.fasta")
+
+        tsv_path = os.path.join(marker_dir, f"{marker_name}.tsv")
+        if not os.path.exists(tsv_path):
+            _representatives_fasta_to_tsv(
+                rep_fasta_path, tsv_path, marker_name
+            )
+
         num_clusters = 0
         if os.path.exists(rep_fasta_path):
             with open(rep_fasta_path) as fh:
