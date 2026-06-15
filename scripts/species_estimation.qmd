@@ -1,0 +1,154 @@
+---
+title: "Species estimation"
+author: "Samuel Aroney"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+format:
+  html:
+    code-fold: true
+execute:
+  echo: False
+---
+
+```{r setup}
+#! include: false
+
+library(treemapify)
+library(cowplot)
+library(tidyverse)
+library(here)
+
+output_dir <- here("results", "species_estimation_qmd", "20260615")
+dir.create(output_dir, recursive = TRUE)
+
+# Colour Brewer paired palette
+colour_brewer <- setNames(append(as.list(RColorBrewer::brewer.pal(12, "Paired")), c("#737373", "#FFFFFF", "#000000")), c("blue", "darkblue", "green", "darkgreen", "red", "darkred", "orange", "darkorange", "purple", "darkpurple", "yellow", "brown", "grey", "white", "black"))
+
+# Paul Tol's vibrant palette - colourblind friendly
+vibrant_colours <- c("#CC3311", "#0077BB", "#009988", "#EE3377", "#EE7733", "#33BBEE")
+# Paul Tol's muted palette - plus 3 extras
+muted_colours <- c("#882255", "#332288", "#DDCC77", "#117733", "#88CCEE", "#CC6677", "#44AA99", "#999933", "#AA4499", "#BBBBBB", "#EE7733", "#CC3311")
+# Paul Tol's bright palette - colourblind friendly
+bright_colours <- c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
+
+cluster_type_levels <- c("genome_linked", "multi_sample", "multi_hit", "single_singleton")
+```
+
+```{r wrangling}
+if (file.exists(here(output_dir, "wrangling.RData"))) {
+  load(here(output_dir, "wrangling.RData"))
+  print("Using prior wrangling")
+} else {
+
+  input_dir <- here("results", "species_estimation", "20260615")
+
+  summary <- read_tsv(here(input_dir, "summary.tsv"))
+
+  cluster_summary <- tibble(
+      marker = list.dirs(here(input_dir), full.names = FALSE, recursive = FALSE)
+    ) %>%
+    filter(str_detect(marker, "^S3.")) %>%
+    mutate(
+      tsv_path = here(input_dir, marker, str_c(marker, ".tsv")),
+      data = map(tsv_path, ~
+        read_tsv(.) %>%
+        mutate(
+          # rep_status = factor(unknown, levels = c(0, 1), labels = c("GlobDB", "unknown")),
+          # rep_hits = hits,
+          cluster_n = cluster_size,
+          cluster_status = n_query > 0,
+          cluster_status = factor(cluster_status, levels = c(TRUE, FALSE), labels = c("GlobDB", "unknown")),
+          # cluster_max_hits = max_hits,
+          cluster_total_hits = total_hits,
+          cluster_type = case_when(
+            cluster_status == "GlobDB" ~ "genome_linked",
+            cluster_n > 1 ~ "multi_sample",
+            cluster_total_hits > 1 ~ "multi_hit",
+            TRUE ~ "single_singleton"
+          ),
+        ) %>%
+        group_by(cluster_type) %>%
+        summarise(
+          n = n(),
+          size_min = min(cluster_n),
+          size_max = max(cluster_n),
+          size_median = median(cluster_n),
+          total_hits_min = min(cluster_total_hits),
+          total_hits_max = max(cluster_total_hits),
+          total_hits_median = median(cluster_total_hits),
+          .groups = "drop"
+          )
+      ),
+    ) %>%
+    select(-c(tsv_path)) %>%
+    unnest(data)
+
+  save.image(here(output_dir, "wrangling.RData"))
+}
+```
+
+```{r stats}
+# Min/max/median OTU and cluster counts
+summary %>%
+  summarise(
+    min_otus = min(num_otus),
+    max_otus = max(num_otus),
+    median_otus = median(num_otus),
+    min_clusters = min(num_clusters),
+    max_clusters = max(num_clusters),
+    median_clusters = median(num_clusters)
+  )
+
+# Cluster types
+cluster_summary %>%
+  select(marker, cluster_type, n) %>%
+  pivot_wider(
+    names_from = cluster_type,
+    values_from = n,
+    values_fill = 0
+  )
+```
+
+```{r analysis}
+# Stacked barplot of cluster types per marker
+cluster_summary %>%
+  group_by(marker) %>%
+  mutate(prop = n / sum(n)) %>%
+  select(marker, cluster_type, n, prop) %>%
+  pivot_longer(cols = c(n, prop), names_to = "metric", values_to = "value") %>%
+  mutate(
+    marker = factor(marker),
+    marker_n = str_extract(marker, "(?<=S3.)\\d+") %>% as.integer(),
+    cluster_type = factor(cluster_type, levels = cluster_type_levels)
+    ) %>%
+  ggplot(aes(x = fct_reorder(marker, marker_n), y = value, fill = cluster_type)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ metric, scales = "free_x") +
+  scale_fill_manual(values = muted_colours, drop = FALSE) +
+  coord_flip() +
+  xlab("Marker") +
+  ylab("Count / Proportion") +
+  theme_cowplot() +
+  theme(legend.position = "bottom")
+ggsave(here(output_dir, "cluster_type_barplot.png"), width = 12, height = 6, dpi = 600)
+
+# Treemap of cluster types as a median proportion across markers
+cluster_summary %>%
+  group_by(marker) %>%
+  mutate(
+    prop = n / sum(n),
+    cluster_type = factor(cluster_type, levels = cluster_type_levels)
+    ) %>%
+  ungroup() %>%
+  group_by(cluster_type) %>%
+  summarise(median_prop = median(prop), .groups = "drop") %>%
+  ggplot(aes(area = median_prop, fill = cluster_type, label = cluster_type)) +
+  treemapify::geom_treemap() +
+  treemapify::geom_treemap_text(
+    colour = "white", place = "centre",
+    grow = FALSE, reflow = TRUE
+  ) +
+  scale_fill_manual(values = muted_colours, drop = FALSE) +
+  theme_cowplot() +
+  theme(legend.position = "none")
+ggsave(here(output_dir, "cluster_type_treemap.png"), width = 12, height = 12, dpi = 600)
+```
