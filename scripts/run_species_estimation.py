@@ -1057,11 +1057,18 @@ def _write_chunk_at_offset(dedup_path, seq_start, n_seqs, out_path):
 
 
 
-def _cluster_file_status(round_clusters, round_input):
+def _cluster_file_status(round_clusters, round_input, max_dropped_seqs=100):
     """
     Returns:
-      'complete' -- line count >= n_input_seqs and non-empty.
-      'partial'  -- file exists and non-empty but fewer lines than expected.
+      'complete' -- line count >= n_input_seqs and non-empty, OR the file is
+                     short by at most `max_dropped_seqs` lines and its last
+                     line is well-formed (not truncated).  smafa occasionally
+                     drops a small, fixed number of sequences per run (e.g.
+                     empty/degenerate sequences) even on a clean exit; those
+                     are treated as permanently skipped rather than triggering
+                     endless rescue/retry cycles.
+      'partial'  -- file exists and non-empty but short by more than
+                     `max_dropped_seqs` lines, or its last line looks truncated.
       'missing'  -- file absent or empty.
     """
     if not os.path.exists(round_clusters) or not os.path.exists(round_input):
@@ -1079,7 +1086,26 @@ def _cluster_file_status(round_clusters, round_input):
         return 'missing'
     if n_cluster_lines >= n_input_seqs:
         return 'complete'
+    shortfall = n_input_seqs - n_cluster_lines
+    if shortfall <= max_dropped_seqs and _last_line_well_formed(round_clusters):
+        return 'complete'
     return 'partial'
+
+
+def _last_line_well_formed(path):
+    """
+    Return True if the last line of `path` is a complete, well-formed
+    "member TAB centroid" row (two non-empty tab-separated fields), i.e. it
+    does not look like a truncated write (e.g. job killed mid-line).
+    """
+    result = subprocess.run(["tail", "-n", "1", path], capture_output=True, text=True)
+    if result.returncode != 0:
+        return False
+    line = result.stdout.rstrip("\n")
+    if not line:
+        return False
+    parts = line.split("\t")
+    return len(parts) >= 2 and bool(parts[0]) and bool(parts[1]) and (len(parts[0]) == len(parts[1]))
 
 
 def _rescue_partial_cluster(round_clusters, round_input, initial_chunk, round_reps):
