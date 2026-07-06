@@ -197,6 +197,17 @@ def _parse_header_stats(header):
     return unknown_rank, hits, n_occurrences, sum_hits
 
 
+def _parse_sample_from_header(header):
+    """
+    Extract the sample name from a per-sample OTU header written by
+    otus_to_fasta(): >otu{i}|{sample}|{gene}|unknown={0or1}|hits={n}
+    Returns None if the header does not have the expected leading tokens
+    (e.g. it has already been through _dedup_fasta_with_counts).
+    """
+    parts = header.lstrip(">").split("|")
+    return parts[1] if len(parts) > 1 else None
+
+
 def _dedup_fasta_with_counts(collated_path, dedup_path):
     """
     Deduplicate a large FASTA by sequence, aggregating occurrence counts and
@@ -325,6 +336,77 @@ def _dedup_fasta_with_counts(collated_path, dedup_path):
                 os.unlink(f)
 
 
+def _write_rep_sample_pair(header, seq, member_to_rep, out_fh):
+    """Emit "rep TAB sample" for one raw per-sample OTU entry, if it maps to a
+    known cluster representative."""
+    rep = member_to_rep.get(seq.replace("-", "N"))
+    if rep is None:
+        return
+    sample = _parse_sample_from_header(header)
+    if sample is None:
+        return
+    out_fh.write(f"{rep}\t{sample}\n")
+
+
+def _compute_rep_sample_counts(collated_path, member_to_rep, marker_dir):
+    """
+    Compute, for each final cluster representative, the number of DISTINCT
+    samples contributing to that cluster (a union across all its member
+    sequences, not a sum -- a sample that contributes two divergent-but-
+    clustered sequences is only counted once).
+
+    Streams the pre-dedup collated FASTA (which still has the sample name
+    embedded in its headers) and uses a disk-based sort -u pass -- the same
+    O(1)-memory pattern as _dedup_fasta_with_counts -- so this scales to
+    datasets with hundreds of thousands of samples without holding any
+    per-sequence or per-cluster sample list in memory.
+
+    Returns {rep_seq: n_samples}.
+    """
+    tmp_pairs = os.path.join(marker_dir, ".rep_sample_pairs.tmp.tsv")
+    tmp_sorted = os.path.join(marker_dir, ".rep_sample_pairs.sorted.tsv")
+    try:
+        with open(collated_path) as in_fh, open(tmp_pairs, "w") as out_fh:
+            cur_hdr = None
+            seq_parts = []
+            for line in in_fh:
+                line = line.rstrip("\n")
+                if line.startswith(">"):
+                    if cur_hdr is not None and seq_parts:
+                        _write_rep_sample_pair(cur_hdr, "".join(seq_parts), member_to_rep, out_fh)
+                    cur_hdr = line
+                    seq_parts = []
+                else:
+                    seq_parts.append(line)
+            if cur_hdr is not None and seq_parts:
+                _write_rep_sample_pair(cur_hdr, "".join(seq_parts), member_to_rep, out_fh)
+
+        subprocess.run(
+            ["sort", "-k1,1", "-k2,2", "-u", "--buffer-size=1G", tmp_pairs, "-o", tmp_sorted],
+            check=True,
+        )
+
+        rep_to_n_samples = {}
+        cur_rep = None
+        count = 0
+        with open(tmp_sorted) as in_fh:
+            for line in in_fh:
+                rep = line.split("\t", 1)[0]
+                if rep == cur_rep:
+                    count += 1
+                else:
+                    if cur_rep is not None:
+                        rep_to_n_samples[cur_rep] = count
+                    cur_rep, count = rep, 1
+            if cur_rep is not None:
+                rep_to_n_samples[cur_rep] = count
+        return rep_to_n_samples
+    finally:
+        for f in (tmp_pairs, tmp_sorted):
+            if os.path.exists(f):
+                os.unlink(f)
+
+
 def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=1):
     """
     Run smafa cluster directly on fasta_path, writing output to a sibling temp file.
@@ -352,14 +434,26 @@ def _run_smafa_cluster_file(fasta_path, max_divergence, marker_name, threads=1):
 
 def _read_fasta_sequences(fasta_path):
     """
-    Read a FASTA file and return (sequences, seq_to_header, seq_to_stats).
+    Read a FASTA file and return (sequences, seq_to_header, seq_to_stats, seq_to_samples).
       sequences:     [(header, seq), ...]  in input order
       seq_to_header: seq -> first header seen
       seq_to_stats:  seq -> (unknown_rank, hits, n_occurrences, sum_hits)
+      seq_to_samples: seq -> set of sample names seen across ALL occurrences of
+                      that exact sequence (not just the first)
     """
     sequences = []
     seq_to_header = {}
     seq_to_stats = {}
+    seq_to_samples = defaultdict(set)
+
+    def _record(header, seq):
+        sequences.append((header, seq))
+        seq_to_header.setdefault(seq, header)
+        seq_to_stats.setdefault(seq, _parse_header_stats(header))
+        sample = _parse_sample_from_header(header)
+        if sample is not None:
+            seq_to_samples[seq].add(sample)
+
     with open(fasta_path) as fh:
         current_header = None
         seq_parts = []
@@ -367,20 +461,14 @@ def _read_fasta_sequences(fasta_path):
             line = line.rstrip("\n")
             if line.startswith(">"):
                 if current_header is not None and seq_parts:
-                    seq = "".join(seq_parts)
-                    sequences.append((current_header, seq))
-                    seq_to_header.setdefault(seq, current_header)
-                    seq_to_stats.setdefault(seq, _parse_header_stats(current_header))
+                    _record(current_header, "".join(seq_parts))
                 current_header = line
                 seq_parts = []
             else:
                 seq_parts.append(line)
         if current_header is not None and seq_parts:
-            seq = "".join(seq_parts)
-            sequences.append((current_header, seq))
-            seq_to_header.setdefault(seq, current_header)
-            seq_to_stats.setdefault(seq, _parse_header_stats(current_header))
-    return sequences, seq_to_header, seq_to_stats
+            _record(current_header, "".join(seq_parts))
+    return sequences, seq_to_header, seq_to_stats, seq_to_samples
 
 
 def _propagate_chunk_results(rep_to_all_members, chunk_clusters_path):
@@ -419,10 +507,14 @@ def _propagate_chunk_results(rep_to_all_members, chunk_clusters_path):
     return new_rep_to_all_members
 
 
-def _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, marker_name):
+def _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, marker_name, seq_to_samples=None):
     """
     Build cluster_tsv and enriched rep_fasta from accumulated cluster state.
     Returns (cluster_tsv_str, rep_fasta_str).
+
+    n_samples counts the number of DISTINCT samples across all member
+    sequences of a cluster (a union, not a sum) so that a sample contributing
+    two divergent-but-clustered sequences is only counted once.
     """
     cluster_tsv_lines = []
     for rep_seq, members in rep_to_all_members.items():
@@ -441,12 +533,19 @@ def _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, mark
         if orig_header is None:
             logging.warning(f"[{marker_name}] Rep sequence not found in FASTA -- skipping.")
             continue
+        n_samples = n_seqs
+        if seq_to_samples is not None:
+            cluster_samples = set()
+            for m in members:
+                cluster_samples.update(seq_to_samples.get(m, ()))
+            n_samples = len(cluster_samples)
         enriched_header = (
             f"{orig_header}"
             f"|cluster_size={n_seqs}"
             f"|n_query={n_query}"
             f"|max_hits={max_hits}"
             f"|total_hits={total_hits}"
+            f"|n_samples={n_samples}"
         )
         rep_fasta_lines.append(enriched_header)
         rep_fasta_lines.append(rep_seq)
@@ -464,7 +563,7 @@ def _cluster_marker_file_chunked(fasta_path, max_divergence, marker_name, chunk_
 
     Returns (cluster_tsv_str, rep_fasta_str).
     """
-    sequences, seq_to_header, seq_to_stats = _read_fasta_sequences(fasta_path)
+    sequences, seq_to_header, seq_to_stats, seq_to_samples = _read_fasta_sequences(fasta_path)
     n_total = len(sequences)
     if n_total == 0:
         return "", ""
@@ -513,10 +612,13 @@ def _cluster_marker_file_chunked(fasta_path, max_divergence, marker_name, chunk_
             f"[{marker_name}] After chunk {chunk_idx + 1}: {len(current_rep_seqs)} cluster(s)."
         )
 
-    return _build_cluster_outputs(rep_to_all_members, seq_to_header, seq_to_stats, marker_name)
+    return _build_cluster_outputs(
+        rep_to_all_members, seq_to_header, seq_to_stats, marker_name,
+        seq_to_samples=seq_to_samples,
+    )
 
 
-def _process_cluster_file(fasta_path, cluster_path, marker_name):
+def _process_cluster_file(fasta_path, cluster_path, marker_name, rep_to_n_samples=None):
     """
     Build the enriched representative FASTA and return (cluster_tsv_str, rep_fasta_str)
     using three streaming passes over the cluster TSV and FASTA files.
@@ -529,6 +631,13 @@ def _process_cluster_file(fasta_path, cluster_path, marker_name):
                             (O(n_unique_seqs)).
     Pass 3 (cluster file):  aggregate per-cluster stats (n_seqs, n_query,
                             max_hits, total_hits) using seq_to_stats.
+
+    rep_to_n_samples, if given, is {rep_seq: n_samples} (distinct sample count
+    per cluster, computed by _compute_rep_sample_counts) and is written into
+    the enriched header as n_samples.  Falls back to n_seqs (cluster_size) for
+    any rep missing from the dict (e.g. sequences dropped by smafa's
+    dash-to-N transform -- see _cluster_file_status), which is a safe upper
+    bound rather than a crash.
     """
     # Pass 1: get the set of representative sequences.
     # smafa writes  sequence TAB centroid  so col 2 is the centroid/rep.
@@ -600,12 +709,16 @@ def _process_cluster_file(fasta_path, cluster_path, marker_name):
         if orig_header is None:
             logging.warning(f"[{marker_name}] Rep sequence not found in FASTA -- skipping.")
             continue
+        n_samples = stats["n_seqs"]
+        if rep_to_n_samples is not None:
+            n_samples = rep_to_n_samples.get(rep_seq, stats["n_seqs"])
         enriched_header = (
             f"{orig_header}"
             f"|cluster_size={stats['n_seqs']}"
             f"|n_query={stats['n_query']}"
             f"|max_hits={stats['max_hits']}"
             f"|total_hits={stats['total_hits']}"
+            f"|n_samples={n_samples}"
         )
         rep_fasta_lines.append(enriched_header)
         rep_fasta_lines.append(rep_seq)
@@ -625,9 +738,9 @@ def _representatives_fasta_to_tsv(rep_fasta_path, tsv_path, marker_name):
         >{id}|{key1}={val1}|{key2}={val2}|...
 
     e.g. (mqsub path)
-        >seq123|unknown=0|hits=5|n_occurrences=2|sum_hits=7|cluster_size=9|n_query=3|max_hits=5|total_hits=12
+        >seq123|unknown=0|hits=5|n_occurrences=2|sum_hits=7|cluster_size=9|n_query=3|max_hits=5|total_hits=12|n_samples=6
     or (local path)
-        >otu0|sample1|gene1|unknown=0|hits=5|cluster_size=9|n_query=3|max_hits=5|total_hits=12
+        >otu0|sample1|gene1|unknown=0|hits=5|cluster_size=9|n_query=3|max_hits=5|total_hits=12|n_samples=6
 
     The leading '|'-separated tokens before the first 'key=value' token (i.e.
     those without an '=') are written to a single 'id' column (joined by '|'
@@ -1915,10 +2028,27 @@ def worker_collate_stats(marker_name, dedup_fasta_path, output_dir):
         for member_seq, rep_seq in member_to_rep.items():
             out_fh.write(f"{member_seq}\t{rep_seq}\n")
 
+    # Compute per-cluster distinct sample counts from the pre-dedup collated
+    # FASTA, which still carries the sample name in its headers (dedup_fasta
+    # only records the count of raw entries, not which samples they came from).
+    collated_path = os.path.join(output_dir, FASTA_SUBDIR, f"{marker_name}.fasta")
+    rep_to_n_samples = None
+    if os.path.exists(collated_path):
+        logging.info(f"[{marker_name}] Computing per-cluster distinct sample counts ...")
+        rep_to_n_samples = _compute_rep_sample_counts(collated_path, member_to_rep, marker_dir)
+    else:
+        logging.warning(
+            f"[{marker_name}] Collated FASTA not found at {collated_path} -- "
+            "n_samples will fall back to cluster_size."
+        )
+
     # Use _process_cluster_file to stream the deduplicated FASTA and compute
     # per-cluster stats, then write representatives.fasta.
     logging.info(f"[{marker_name}] Computing per-cluster stats and writing representatives.fasta ...")
-    _, rep_fasta = _process_cluster_file(dedup_fasta_path, final_clusters_path, marker_name)
+    _, rep_fasta = _process_cluster_file(
+        dedup_fasta_path, final_clusters_path, marker_name,
+        rep_to_n_samples=rep_to_n_samples,
+    )
 
     rep_fasta_path = os.path.join(marker_dir, "representatives.fasta")
     with open(rep_fasta_path, "w") as fh:
