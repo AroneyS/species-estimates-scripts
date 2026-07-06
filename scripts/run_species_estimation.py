@@ -941,12 +941,77 @@ def _cat_one_marker(args_tuple):
     return marker_name, collated_path
 
 
-def cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads=1):
+def worker_cat_marker(marker_name, list_file, collated_path):
+    """Entry point for a single-marker cat mqsub job (invoked by submit_cat_jobs)."""
+    with open(list_file) as fh:
+        sample_fastas = [line.rstrip("\n") for line in fh if line.strip()]
+    _cat_one_marker((marker_name, sample_fastas, collated_path))
+    logging.info(f"[{marker_name}] Collated {len(sample_fastas)} sample FASTA(s) into {collated_path}.")
+
+
+def submit_cat_jobs(pending_args, fasta_dir, this_script_path):
+    """
+    Submit one mqsub job per marker to concatenate that marker's per-sample
+    FASTAs.  Each marker's file list (which can run into the hundreds of
+    thousands of paths at full dataset scale) is written to a manifest file
+    that the worker reads, since passing it on the command line is not
+    practical.  Blocks until all jobs finish.
+    """
+    logging.info(f"Submitting {len(pending_args)} cat job(s) via mqsub (one per marker) ...")
+
+    manifest_paths = []
+    with tempfile.NamedTemporaryFile(
+        mode="w", prefix="cat_mqsub_", suffix=".cmds", delete=False
+    ) as cmd_file:
+        cmd_file_path = cmd_file.name
+        for marker_name, sample_fastas, collated_path in pending_args:
+            manifest_path = os.path.join(fasta_dir, f"{marker_name}.filelist")
+            with open(manifest_path, "w") as mf:
+                mf.write("\n".join(sample_fastas) + "\n")
+            manifest_paths.append(manifest_path)
+            cmd = (
+                f"python3 {this_script_path}"
+                f" --_cat-marker-name {marker_name}"
+                f" --_cat-marker-list-file {manifest_path}"
+                f" --_cat-marker-output {collated_path}"
+            )
+            cmd_file.write(cmd + "\n")
+
+    try:
+        mqsub_cmd = (
+            f"mqsub -m 4 --name cat_fastas"
+            f" --segregated-log-files"
+            f" --hours 6"
+            f" --command-file {cmd_file_path}"
+            f" --chunk-size 1 2>&1"
+        )
+        logging.info(f"Running: {mqsub_cmd}")
+        mqsub_stdout = extern.run(mqsub_cmd)
+        _mqwait(mqsub_stdout)
+    finally:
+        os.unlink(cmd_file_path)
+        for manifest_path in manifest_paths:
+            if os.path.exists(manifest_path):
+                os.unlink(manifest_path)
+
+    logging.info("All cat jobs finished.")
+
+
+def cat_sample_fastas(
+    archive_paths, output_dir, markers_of_interest, threads=1,
+    run_through_mqsub=False, this_script_path=None,
+):
     """
     After per-sample extraction jobs have run, cat all per-sample per-marker
     FASTAs into one file per marker.
 
     If a collated FASTA already exists for a marker it is reused as-is.
+
+    With run_through_mqsub=True, one mqsub job per marker performs the actual
+    concatenation (submit_cat_jobs) instead of local threads/serial map --
+    at full dataset scale (hundreds of thousands of samples) each marker's
+    cat involves opening that many tiny per-sample files, which is far too
+    slow to do serially on the login node.
 
     Returns a dict: marker_name -> collated_fasta_path.
     """
@@ -999,17 +1064,24 @@ def cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads=1)
             pending_args.append((marker_name, sample_fastas, collated_path))
 
     if pending_args:
-        logging.info(
-            f"Concatenating sample FASTAs for {len(pending_args)} marker(s) "
-            f"across {threads} thread(s) ..."
-        )
-        if threads > 1:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-                for marker_name, collated_path in executor.map(_cat_one_marker, pending_args):
-                    marker_to_fasta[marker_name] = collated_path
-        else:
-            for marker_name, collated_path in map(_cat_one_marker, pending_args):
+        if run_through_mqsub:
+            if not this_script_path:
+                raise ValueError("this_script_path is required when run_through_mqsub=True")
+            submit_cat_jobs(pending_args, fasta_dir, this_script_path)
+            for marker_name, _, collated_path in pending_args:
                 marker_to_fasta[marker_name] = collated_path
+        else:
+            logging.info(
+                f"Concatenating sample FASTAs for {len(pending_args)} marker(s) "
+                f"across {threads} thread(s) ..."
+            )
+            if threads > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+                    for marker_name, collated_path in executor.map(_cat_one_marker, pending_args):
+                        marker_to_fasta[marker_name] = collated_path
+            else:
+                for marker_name, collated_path in map(_cat_one_marker, pending_args):
+                    marker_to_fasta[marker_name] = collated_path
         logging.info(f"Collation complete -- {len(pending_args)} marker(s) concatenated.")
     else:
         logging.info("All collated FASTA(s) already exist -- skipping concatenation.")
@@ -2113,8 +2185,11 @@ def collate_and_cluster(
         else:
             logging.info("Skipping Phase 1 extraction -- already done.")
 
-        # Phase 2: cat per-sample FASTAs into per-marker FASTAs (local, fast)
-        marker_to_fasta = cat_sample_fastas(archive_paths, output_dir, markers_of_interest, threads)
+        # Phase 2: cat per-sample FASTAs into per-marker FASTAs, one mqsub job per marker
+        marker_to_fasta = cat_sample_fastas(
+            archive_paths, output_dir, markers_of_interest, threads,
+            run_through_mqsub=True, this_script_path=this_script_path,
+        )
         if not marker_to_fasta:
             logging.warning("No markers with sequences -- nothing to cluster.")
             return
@@ -2295,6 +2370,10 @@ if __name__ == "__main__":
     # Stats-collation worker args (Phase C of mqsub path)
     parser.add_argument("--_collate-stats-marker", metavar="NAME", help=argparse.SUPPRESS)
     parser.add_argument("--_collate-stats-dedup-fasta", metavar="FILE", help=argparse.SUPPRESS)
+    # Per-marker cat worker args (Phase 2 of mqsub path)
+    parser.add_argument("--_cat-marker-name", metavar="NAME", help=argparse.SUPPRESS)
+    parser.add_argument("--_cat-marker-list-file", metavar="FILE", help=argparse.SUPPRESS)
+    parser.add_argument("--_cat-marker-output", metavar="FILE", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -2322,6 +2401,19 @@ if __name__ == "__main__":
             marker_domains_tsv=args._marker_domains_tsv,
             sample_fasta_dir=args._sample_fasta_dir,
             markers_of_interest=set(args.markers) if args.markers else None,
+        )
+        sys.exit(0)
+
+    # --- Worker path: per-marker cat job (Phase 2, invoked by mqsub) ---
+    if args._cat_marker_name:
+        if not args._cat_marker_list_file or not args._cat_marker_output:
+            parser.error(
+                "--_cat-marker-name requires --_cat-marker-list-file and --_cat-marker-output"
+            )
+        worker_cat_marker(
+            marker_name=args._cat_marker_name,
+            list_file=args._cat_marker_list_file,
+            collated_path=args._cat_marker_output,
         )
         sys.exit(0)
 
