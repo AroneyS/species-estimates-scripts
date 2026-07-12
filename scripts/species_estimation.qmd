@@ -17,7 +17,7 @@ library(cowplot)
 library(tidyverse)
 library(here)
 
-output_dir <- here("results", "species_estimation_qmd", "20260615")
+output_dir <- here("results", "species_estimation_qmd", "20260713")
 dir.create(output_dir, recursive = TRUE)
 
 # Colour Brewer paired palette
@@ -39,7 +39,7 @@ if (file.exists(here(output_dir, "wrangling.RData"))) {
   print("Using prior wrangling")
 } else {
 
-  input_dir <- here("results", "species_estimation", "20260615")
+  input_dir <- here("results", "species_estimation", "20260704")
 
   summary <- read_tsv(here(input_dir, "summary.tsv"))
 
@@ -54,14 +54,15 @@ if (file.exists(here(output_dir, "wrangling.RData"))) {
         mutate(
           # rep_status = factor(unknown, levels = c(0, 1), labels = c("GlobDB", "unknown")),
           # rep_hits = hits,
-          cluster_n = cluster_size,
+          # cluster_n = cluster_size,
+          cluster_samples = n_samples,
           cluster_status = n_query > 0,
           cluster_status = factor(cluster_status, levels = c(TRUE, FALSE), labels = c("GlobDB", "unknown")),
           # cluster_max_hits = max_hits,
           cluster_total_hits = total_hits,
           cluster_type = case_when(
             cluster_status == "GlobDB" ~ "genome_linked",
-            cluster_n > 1 ~ "multi_sample",
+            cluster_samples > 1 ~ "multi_sample",
             cluster_total_hits > 1 ~ "multi_hit",
             TRUE ~ "single_singleton"
           ),
@@ -69,9 +70,9 @@ if (file.exists(here(output_dir, "wrangling.RData"))) {
         group_by(cluster_type) %>%
         summarise(
           n = n(),
-          size_min = min(cluster_n),
-          size_max = max(cluster_n),
-          size_median = median(cluster_n),
+          size_min = min(cluster_samples),
+          size_max = max(cluster_samples),
+          size_median = median(cluster_samples),
           total_hits_min = min(cluster_total_hits),
           total_hits_max = max(cluster_total_hits),
           total_hits_median = median(cluster_total_hits),
@@ -106,6 +107,31 @@ cluster_summary %>%
     values_from = n,
     values_fill = 0
   )
+
+# Cluster type proportions
+cluster_summary %>%
+  select(marker, cluster_type, n) %>%
+  pivot_wider(
+    names_from = cluster_type,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  mutate(
+    total = rowSums(across(where(is.numeric))),
+    across(where(is.numeric), ~ .x / total)
+  ) %>%
+  pivot_longer(
+    cols = c(genome_linked, multi_sample, multi_hit, single_singleton),
+    names_to = "cluster_type",
+    values_to = "prop"
+  ) %>%
+  group_by(cluster_type) %>%
+  summarise(
+    min_prop = min(prop),
+    max_prop = max(prop),
+    median_prop = median(prop),
+    .groups = "drop"
+  )
 ```
 
 ```{r analysis}
@@ -124,6 +150,7 @@ cluster_summary %>%
   geom_bar(stat = "identity") +
   facet_wrap(~ metric, scales = "free_x") +
   scale_fill_manual(values = muted_colours, drop = FALSE) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
   coord_flip() +
   xlab("Marker") +
   ylab("Count / Proportion") +
