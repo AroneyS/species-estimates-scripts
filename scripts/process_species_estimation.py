@@ -5,7 +5,7 @@
 #    Summarise a species_estimation output folder (e.g.
 #    results/species_estimation/20260704) into a tidy TSV of:
 #        marker  stratum  stratum_value  sample_count  species_count
-#    where species_count is the number of species (clusters) that appear in
+#    where species_count is the number of clusters (treated as species) that appear in
 #    exactly sample_count samples, for each marker and each metadata stratum:
 #      - stratum="all", stratum_value="all": the unstratified count, from
 #        {marker}/{marker}.tsv's n_samples column.
@@ -16,6 +16,11 @@
 #      - stratum="domain"/"phylum", stratum_value=<taxon>: assigned per
 #        cluster representative by running representatives.fasta through
 #        `singlem renew` against a SingleM metapackage (default: GlobDB_r232).
+#
+#    Strict GlobDB proximity is queried separately for ALL representatives.
+#    globdb_matches.tsv records best hits; globdb_summary.tsv reports confirmed
+#    clusters and distinct matched species per marker. The sample-count table
+#    remains a CLUSTER histogram; it is not a species-prevalence histogram.
 #
 #    Strata don't sum to the "all" total: a species can appear in samples from
 #    several years (or both host/ecological), so it's counted once per stratum
@@ -32,6 +37,7 @@
 ###############################################################################
 
 import argparse
+import hashlib
 import csv
 import json
 import logging
@@ -40,6 +46,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import shlex
+import sqlite3
+import uuid
+from contextlib import closing, contextmanager
 from collections import Counter
 
 MARKER_DIR_RE = re.compile(r"^S\d+\.")
@@ -63,6 +73,170 @@ DEFAULT_SMAFA_BIN_DIR = os.path.join(REPO_ROOT, ".pixi", "envs", "default", "bin
 NA = "NA"
 
 
+@contextmanager
+def atomic_text(path):
+    """Publish only complete files, so an interrupted worker cannot look done."""
+    with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(os.path.abspath(path)),
+                                     prefix=".processing_", delete=False) as fh:
+        temporary = fh.name
+        try:
+            yield fh
+            fh.close()
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+GLOBDB_MATCHES = "globdb_matches.tsv"
+GLOBDB_SUMMARY = "globdb_summary.json"
+GLOBDB_MANIFEST = "globdb_complete.json"
+
+
+def _file_identity(path):
+    path = os.path.realpath(path)
+    stat = os.stat(path)
+    return [path, stat.st_size, stat.st_mtime_ns]
+
+
+def globdb_provenance(marker_dir, db, max_divergence, singlem_bin):
+    # Fixed paths only: never traverse the reference database on the login node.
+    with open(__file__, "rb") as source:
+        processor_hash = hashlib.sha256(source.read()).hexdigest()
+    return {
+        "schema": 1, "cohort": "all_representatives",
+        "representatives": _file_identity(os.path.join(marker_dir, "representatives.fasta")),
+        "database": _file_identity(db),
+        "database_otus": _file_identity(os.path.join(db, "otus.sqlite3")),
+        "database_contents": _file_identity(os.path.join(db, "CONTENTS.json")),
+        "marker_index": _file_identity(os.path.join(
+            db, "nucleotide_indices_smafa_naive",
+            os.path.basename(os.path.normpath(marker_dir)) + ".smafa_naive_index")),
+        "processor_sha256": processor_hash,
+        "singlem": _file_identity(singlem_bin),
+        "max_divergence": max_divergence, "max_nearest_neighbours": 1,
+        "tie_policy": "first_returned_at_lowest_divergence",
+    }
+
+
+def globdb_complete(marker_dir, provenance):
+    try:
+        with open(os.path.join(marker_dir, GLOBDB_MANIFEST)) as fh:
+            manifest = json.load(fh)
+        return manifest == {
+            "provenance": provenance,
+            "outputs": [_file_identity(os.path.join(marker_dir, name))
+                        for name in (GLOBDB_MATCHES, GLOBDB_SUMMARY)],
+        }
+    except (OSError, ValueError):
+        return False
+
+
+def _query_best_hits(path, batch, max_divergence):
+    """Choose minimum divergence; retain the first returned hit on ties.
+
+    A hit lacking a species name still confirms reference proximity. Do not
+    turn it into a no-hit or select a worse named hit to inflate species counts.
+    """
+    expected = {rep_id for rep_id, _ in batch}
+    if len(expected) != len(batch):
+        raise ValueError("Duplicate representative IDs in query batch")
+    best = {}
+    with open(path) as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        required = {"query_name", "divergence", "taxonomy"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"Invalid SingleM query output header in {path}")
+        for row in reader:
+            rep_id = row["query_name"]
+            div = int(row["divergence"])
+            if rep_id not in expected or not 0 <= div <= max_divergence:
+                raise ValueError(f"Unexpected query hit: {row}")
+            if rep_id not in best or div < best[rep_id][0]:
+                taxonomy = row["taxonomy"] or ""
+                best[rep_id] = (div, _parse_taxonomy_token(taxonomy, "s__"), taxonomy)
+    return best
+
+
+def worker_globdb_marker(output_dir, marker_name, db, singlem_bin, smafa_bin_dir,
+                         max_divergence=2, chunk_size=1_000_000):
+    """Query every representative, with bounded batches and disk-based species dedup.
+
+    Outputs describe representative proximity, not proximity of every member
+    of a cluster. Distinct matched species use one best hit per representative;
+    ties can be ambiguous and these counts are not a total species census.
+    """
+    marker_dir = os.path.join(output_dir, marker_name)
+    provenance = globdb_provenance(marker_dir, db, max_divergence, singlem_bin)
+    manifest_path = os.path.join(marker_dir, GLOBDB_MANIFEST)
+    if os.path.exists(manifest_path):
+        os.unlink(manifest_path)
+    counts = Counter()
+    with tempfile.TemporaryDirectory(prefix=".globdb_", dir=marker_dir) as temp:
+        otu_path = os.path.join(temp, "queries.tsv")
+        result_path = os.path.join(temp, "hits.tsv")
+        with closing(sqlite3.connect(os.path.join(temp, "species.sqlite3"))) as species_db, \
+                atomic_text(os.path.join(marker_dir, GLOBDB_MATCHES)) as out:
+            species_db.execute("CREATE TABLE species (name TEXT PRIMARY KEY)")
+            writer = csv.writer(out, delimiter="\t", lineterminator="\n")
+            writer.writerow(["id", "sequence", "globdb_status", "divergence", "species", "taxonomy"])
+            for index, batch in enumerate(_iter_representative_batches(
+                    os.path.join(marker_dir, "representatives.fasta"), chunk_size)):
+                logging.info("[%s] GlobDB query batch %d (%d representatives)",
+                             marker_name, index + 1, len(batch))
+                with open(otu_path, "w") as fh:
+                    table = csv.writer(fh, delimiter="\t", lineterminator="\n")
+                    table.writerow(["gene", "sample", "sequence", "num_hits", "coverage", "taxonomy"])
+                    table.writerows((marker_name, rep_id, seq, 1, 1, "") for rep_id, seq in batch)
+                # singlem 0.20.3 query's --threads is untyped: omit it (default 1).
+                cmd = [singlem_bin, "query", "--db", db, "--query-otu-table", otu_path,
+                       "--max-divergence", str(max_divergence),
+                       "--max-nearest-neighbours", "1", "--preload-db",
+                       "--search-method", "smafa-naive"]
+                env = dict(os.environ, TMPDIR=os.path.abspath(temp))
+                env["PATH"] = smafa_bin_dir + os.pathsep + env.get("PATH", "")
+                with open(result_path, "w") as results, \
+                        open(os.path.join(marker_dir, "globdb_query.log"), "a") as log:
+                    subprocess.run(cmd, stdout=results, stderr=log, env=env, check=True)
+                best = _query_best_hits(result_path, batch, max_divergence)
+                for rep_id, seq in batch:
+                    counts["raw_clusters"] += 1
+                    hit = best.get(rep_id)
+                    if hit is None:
+                        writer.writerow([rep_id, seq, "no_match", "", "", ""])
+                        continue
+                    div, species, taxonomy = hit
+                    counts["confirmed_clusters"] += 1
+                    counts[f"divergence_{div}"] += 1
+                    if species != NA:
+                        counts["confirmed_clusters_with_species"] += 1
+                        species_db.execute("INSERT OR IGNORE INTO species VALUES (?)", (species,))
+                    writer.writerow([rep_id, seq, "confirmed", div,
+                                     species if species != NA else "", taxonomy])
+                species_db.commit()
+            distinct = species_db.execute("SELECT COUNT(*) FROM species").fetchone()[0]
+        summary = {
+            "marker": marker_name, "query_db": os.path.realpath(db),
+            "max_divergence": max_divergence, "raw_clusters": counts["raw_clusters"],
+            "confirmed_clusters": counts["confirmed_clusters"],
+            "unmatched_clusters": counts["raw_clusters"] - counts["confirmed_clusters"],
+            "confirmed_clusters_with_species": counts["confirmed_clusters_with_species"],
+            "distinct_matched_species": distinct,
+            "confirmed_fraction": (counts["confirmed_clusters"] / counts["raw_clusters"]
+                                   if counts["raw_clusters"] else None),
+            "divergence_counts": {str(d): counts[f"divergence_{d}"]
+                                  for d in range(max_divergence + 1)},
+        }
+        with atomic_text(os.path.join(marker_dir, GLOBDB_SUMMARY)) as fh:
+            json.dump(summary, fh, indent=2)
+    if provenance != globdb_provenance(marker_dir, db, max_divergence, singlem_bin):
+        raise RuntimeError("GlobDB inputs changed during processing")
+    with atomic_text(manifest_path) as fh:
+        json.dump({"provenance": provenance,
+                   "outputs": [_file_identity(os.path.join(marker_dir, name))
+                               for name in (GLOBDB_MATCHES, GLOBDB_SUMMARY)]}, fh, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Shared mqsub submit/wait helpers (same pattern as run_species_estimation.py)
 # ---------------------------------------------------------------------------
@@ -76,29 +250,27 @@ def _submit_mqsub_batch(cmds, name, memory_gb, hours, threads=1, chunk_size=1):
     if not cmds:
         return []
     with tempfile.NamedTemporaryFile(
-        mode="w", prefix=f"{name}_mqsub_", suffix=".cmds", delete=False
+        mode="w", prefix=f"{name}_mqsub_", suffix=".cmds", dir=os.getcwd(), delete=False
     ) as cmd_file:
         cmd_file_path = cmd_file.name
         for cmd in cmds:
             cmd_file.write(cmd + "\n")
     try:
-        mqsub_cmd = (
-            f"mqsub -m {memory_gb} -t {threads} --name {name}"
-            f" --segregated-log-files --hours {hours}"
-            f" --command-file {cmd_file_path} --chunk-size {chunk_size}"
-        )
-        logging.info(f"Running: {mqsub_cmd}")
-        # mqsub writes its log output -- including the "qsub stdout: X.aqua"
-        # job-ID lines _parse_job_ids looks for -- to STDERR, not stdout, so
-        # stderr must be merged into stdout (not just captured separately)
-        # or job_ids silently comes back empty and _wait_for_jobs never
-        # actually waits for anything.
+        mqsub_cmd = [
+            "mqsub", "--no-email", "--bg", "-m", str(memory_gb), "-t", str(threads),
+            "--name", name, "--segregated-log-files", "--hours", str(hours),
+            "--command-file", cmd_file_path, "--chunk-size", str(chunk_size),
+        ]
+        logging.info("Running: %s", shlex.join(mqsub_cmd))
         result = subprocess.run(
-            mqsub_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+            mqsub_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         if result.returncode != 0:
             raise RuntimeError(f"mqsub submission failed:\n{result.stdout}")
-        return _parse_job_ids(result.stdout)
+        job_ids = _parse_job_ids(result.stdout)
+        if not job_ids:
+            raise RuntimeError(f"mqsub returned no job IDs:\n{result.stdout}")
+        return job_ids
     finally:
         os.unlink(cmd_file_path)
 
@@ -107,7 +279,7 @@ def _parse_job_ids(mqsub_stdout):
     r = re.compile(r'^qsub stdout: (\d+\.aqua)$')
     job_ids = []
     for line in mqsub_stdout.split("\n"):
-        m = r.match(line)
+        m = r.match(line.strip())
         if m:
             job_ids.append(m.group(1))
     return job_ids
@@ -117,10 +289,10 @@ def _wait_for_jobs(job_ids):
     if not job_ids:
         return
     logging.info(f"Waiting for {len(job_ids)} job(s) to finish ...")
-    with tempfile.NamedTemporaryFile(mode="w", prefix="mqwait_", suffix=".ids") as f:
+    with tempfile.NamedTemporaryFile(mode="w", prefix="mqwait_", suffix=".ids", dir=os.getcwd()) as f:
         f.write("\n".join(job_ids) + "\n")
         f.flush()
-        subprocess.run(f"mqwait -i {f.name}", shell=True, check=True)
+        subprocess.run(["mqwait", "-i", f.name], check=True)
 
 
 # ---------------------------------------------------------------------------
@@ -129,19 +301,29 @@ def _wait_for_jobs(job_ids):
 
 def export_sample_metadata(duckdb_path, output_path, host_column="host_or_not_mature"):
     """Export (acc, year, host_or_not) from the sandpiper duckdb to output_path."""
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", host_column):
+        raise ValueError("Invalid metadata column name")
+    temporary_path = os.path.abspath(output_path) + "." + uuid.uuid4().hex + ".tmp"
+    sql_output_path = temporary_path.replace("'", "''")
     query = (
         "COPY (SELECT m.acc AS acc, a.collection_year AS year, "
         f"a.{host_column} AS host_or_not "
         "FROM ncbi_metadata m "
         "LEFT JOIN parsed_sample_attributes a ON a.run_id = m.id) "
-        f"TO '{output_path}' (FORMAT CSV, DELIMITER '\\t', HEADER)"
+        f"TO '{sql_output_path}' (FORMAT CSV, DELIMITER '\\t', HEADER)"
     )
-    cmd = ["duckdb", "-readonly", duckdb_path, "-c", query]
+    cmd = ["mqsub", "--no-email", "-t", "1", "-m", "8", "--hours", "2",
+           "--", "duckdb", "-readonly", duckdb_path, "-c", query]
     logging.info(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"duckdb export failed:\n{result.stderr}")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"duckdb export failed:\n{result.stderr}")
+        os.replace(temporary_path, output_path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
     logging.info(f"Sample metadata written to {output_path}")
 
 
@@ -336,7 +518,7 @@ def _tally_histogram(dedup_sorted_path):
 
 
 def write_histogram(counts, output_path):
-    with open(output_path, "w") as fh:
+    with atomic_text(output_path) as fh:
         fh.write("stratum\tstratum_value\tsample_count\tspecies_count\n")
         for (stratum, value, sample_count), species_count in sorted(counts.items()):
             if sample_count > 0 and species_count > 0:
@@ -438,6 +620,8 @@ def _iter_representative_batches(rep_fasta_path, batch_size):
     whole file to one archive OTU table -- is what keeps memory bounded: see
     _write_archive_otu_table_batch and the OOM note on worker_taxonomy_marker.
     """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     batch = []
     cur_hdr = None
     seq_parts = []
@@ -544,7 +728,7 @@ def _parse_taxonomy_token(taxonomy, prefix):
     token, which simply won't match either prefix), or NA if absent."""
     for token in taxonomy.split(";"):
         token = token.strip()
-        if token.startswith(prefix):
+        if token.startswith(prefix) and token != prefix:
             return token
     return NA
 
@@ -673,7 +857,7 @@ def find_marker_dirs(input_dir, restrict=None):
 def count_all_sample_counts(marker_tsv_path):
     """
     Stream a marker's {marker}.tsv and return a Counter mapping
-    n_samples -> number of species (rows) with that n_samples value.
+    n_samples -> number of clusters (rows) with that n_samples value.
     """
     counts = Counter()
     with open(marker_tsv_path, newline="") as fh:
@@ -693,7 +877,7 @@ def read_histogram(tsv_path):
                 row["stratum"],
                 row["stratum_value"],
                 int(row["sample_count"]),
-                int(row["species_count"]),
+                int(row["cluster_count"] if "cluster_count" in row else row["species_count"]),
             )
 
 
@@ -702,8 +886,7 @@ def summarise(input_dir, markers):
     for marker_name, marker_dir in markers:
         marker_tsv_path = os.path.join(marker_dir, f"{marker_name}.tsv")
         if not os.path.isfile(marker_tsv_path):
-            logging.warning(f"No {marker_name}.tsv found in {marker_dir} -- skipping.")
-            continue
+            raise FileNotFoundError(marker_tsv_path)
 
         logging.info(f"Aggregating {marker_name} ...")
         counts = count_all_sample_counts(marker_tsv_path)
@@ -727,10 +910,23 @@ def run_orchestrator(args):
     if not markers:
         raise SystemExit(f"No marker subdirectories found in {args.input_dir}")
 
+    if args.markers:
+        missing_markers = set(args.markers) - {name for name, _ in markers}
+        if missing_markers:
+            raise ValueError(f"Marker directories not found: {sorted(missing_markers)}")
+    for name, directory in markers:
+        if not os.path.isfile(os.path.join(directory, f"{name}.tsv")):
+            raise FileNotFoundError(os.path.join(directory, f"{name}.tsv"))
+        if not args.skip_globdb:
+            globdb_provenance(directory, args.query_db, args.query_max_divergence, args.singlem_bin)
+
     stratify_job_ids = []
     taxonomy_job_ids = []
+    globdb_job_ids = []
+    required_outputs = []
 
     if not args.skip_stratify_metadata:
+        required_outputs.extend(os.path.join(d, STRATIFIED_COUNTS_FILENAME) for _, d in markers)
         if not os.path.isfile(args.sample_metadata):
             logging.info(f"{args.sample_metadata} not found -- exporting from {args.duckdb} ...")
             export_sample_metadata(args.duckdb, args.sample_metadata, args.host_column)
@@ -742,9 +938,9 @@ def run_orchestrator(args):
         if pending:
             logging.info(f"Submitting {len(pending)} year/host stratification job(s) via mqsub ...")
             cmds = [
-                f"python3 {THIS_SCRIPT_PATH} {args.input_dir}"
-                f" --_stratify-marker {marker_name}"
-                f" --sample-metadata {args.sample_metadata}"
+                f"python3 {shlex.quote(THIS_SCRIPT_PATH)} {shlex.quote(args.input_dir)}"
+                f" --_stratify-marker {shlex.quote(marker_name)}"
+                f" --sample-metadata {shlex.quote(args.sample_metadata)}"
                 f" --threads {args.sort_threads}"
                 for marker_name, _ in pending
             ]
@@ -756,6 +952,7 @@ def run_orchestrator(args):
             logging.info("All markers already have year/host stratified counts.")
 
     if not args.skip_taxonomy:
+        required_outputs.extend(os.path.join(d, TAXONOMY_COUNTS_FILENAME) for _, d in markers)
         pending = [
             (name, d) for name, d in markers
             if not os.path.isfile(os.path.join(d, TAXONOMY_COUNTS_FILENAME))
@@ -763,11 +960,11 @@ def run_orchestrator(args):
         if pending:
             logging.info(f"Submitting {len(pending)} domain/phylum taxonomy job(s) via mqsub ...")
             cmds = [
-                f"python3 {THIS_SCRIPT_PATH} {args.input_dir}"
-                f" --_taxonomy-marker {marker_name}"
-                f" --metapackage {args.metapackage}"
-                f" --singlem-bin {args.singlem_bin}"
-                f" --smafa-bin-dir {args.smafa_bin_dir}"
+                f"python3 {shlex.quote(THIS_SCRIPT_PATH)} {shlex.quote(args.input_dir)}"
+                f" --_taxonomy-marker {shlex.quote(marker_name)}"
+                f" --metapackage {shlex.quote(args.metapackage)}"
+                f" --singlem-bin {shlex.quote(args.singlem_bin)}"
+                f" --smafa-bin-dir {shlex.quote(args.smafa_bin_dir)}"
                 f" --threads {args.taxonomy_threads}"
                 f" --taxonomy-chunk-size {args.taxonomy_chunk_size}"
                 for marker_name, _ in pending
@@ -779,15 +976,72 @@ def run_orchestrator(args):
         else:
             logging.info("All markers already have domain/phylum stratified counts.")
 
-    _wait_for_jobs(stratify_job_ids + taxonomy_job_ids)
+    if not args.skip_globdb:
+        pending = [(name, d) for name, d in markers
+                   if not globdb_complete(d, globdb_provenance(
+                       d, args.query_db, args.query_max_divergence, args.singlem_bin))]
+        cmds = [shlex.join([
+            sys.executable, THIS_SCRIPT_PATH, args.input_dir, "--_globdb-marker", name,
+            "--query-db", args.query_db, "--singlem-bin", args.singlem_bin,
+            "--smafa-bin-dir", args.smafa_bin_dir,
+            "--query-max-divergence", str(args.query_max_divergence),
+            "--query-chunk-size", str(args.query_chunk_size),
+        ]) for name, _ in pending]
+        globdb_job_ids = _submit_mqsub_batch(
+            cmds, "globdb_query", args.query_memory, args.query_hours, threads=1)
 
+    _wait_for_jobs(stratify_job_ids + taxonomy_job_ids + globdb_job_ids)
+    missing = [p for p in required_outputs if not os.path.isfile(p)]
+    if missing:
+        raise RuntimeError(f"Workers did not produce required outputs: {missing}")
+    if not args.skip_globdb:
+        for name, d in markers:
+            if not globdb_complete(d, globdb_provenance(
+                    d, args.query_db, args.query_max_divergence, args.singlem_bin)):
+                raise RuntimeError(f"GlobDB worker did not complete successfully: {name}")
+
+    # Reading tens of millions of marker TSV rows belongs on a compute node.
+    cmd = [sys.executable, THIS_SCRIPT_PATH, args.input_dir, "--_summarise",
+           "--output", args.output or os.path.join(args.input_dir, "sample_count_summary.tsv")]
+    if args.markers:
+        cmd += ["--markers", *args.markers]
+    if args.skip_globdb:
+        cmd += ["--skip-globdb"]
+    # A unique completion receipt detects failed jobs even if old summaries exist.
+    receipt = os.path.join(args.input_dir, ".summary_" + uuid.uuid4().hex)
+    cmd += ["--_summary-receipt", receipt]
+    try:
+        job_ids = _submit_mqsub_batch([shlex.join(cmd)], "species_summary", 8, 4)
+        _wait_for_jobs(job_ids)
+        if not os.path.isfile(receipt):
+            raise RuntimeError("Summary worker did not complete; check its queue log")
+    finally:
+        if os.path.exists(receipt):
+            os.unlink(receipt)
+
+
+def worker_summarise(args):
+    markers = find_marker_dirs(args.input_dir, restrict=set(args.markers) if args.markers else None)
     output_path = args.output or os.path.join(args.input_dir, "sample_count_summary.tsv")
-    with open(output_path, "w", newline="") as out_fh:
+    with atomic_text(output_path) as out_fh:
         writer = csv.writer(out_fh, delimiter="\t")
         writer.writerow(["marker", "stratum", "stratum_value", "sample_count", "species_count"])
-        for row in summarise(args.input_dir, markers):
-            writer.writerow(row)
-    logging.info(f"Summary written to {output_path}")
+        writer.writerows(summarise(args.input_dir, markers))
+    logging.info("Cluster summary written to %s", output_path)
+    if not args.skip_globdb:
+        path = os.path.join(args.input_dir, "globdb_summary.tsv")
+        fields = ["marker", "query_db", "max_divergence", "raw_clusters", "confirmed_clusters", "unmatched_clusters",
+                  "confirmed_clusters_with_species", "distinct_matched_species", "confirmed_fraction"]
+        with atomic_text(path) as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, delimiter="\t", extrasaction="ignore")
+            writer.writeheader()
+            for _, marker_dir in markers:
+                with open(os.path.join(marker_dir, GLOBDB_SUMMARY)) as summary:
+                    writer.writerow(json.load(summary))
+        logging.info("GlobDB summary written to %s", path)
+    if args._summary_receipt:
+        with atomic_text(args._summary_receipt) as fh:
+            fh.write("complete\n")
 
 
 THIS_SCRIPT_PATH = os.path.abspath(__file__)
@@ -812,7 +1066,7 @@ def main():
 
     # --- Year/host stratification ---
     parser.add_argument("--skip-stratify-metadata", action="store_true",
-                         help="Skip year/host stratification (only 'all' rows are written).")
+                         help="Skip recomputing year/host counts; existing counts are still included.")
     parser.add_argument("--duckdb", default=DEFAULT_DUCKDB,
                          help="Sandpiper duckdb path, used only if --sample-metadata doesn't "
                               "already exist.")
@@ -878,6 +1132,19 @@ def main():
                               "approach this ceiling; there is no larger value available if it "
                               "doesn't fit.")
 
+    parser.add_argument("--skip-globdb", action="store_true",
+                        help="Skip strict GlobDB queries and GlobDB summary generation.")
+    parser.add_argument("--query-db", help="Nucleotide sdb directory (default: <metapackage>/new_metapackage.sdb).")
+    parser.add_argument("--query-max-divergence", type=int, default=2,
+                        help="Maximum nucleotide divergence for reference matching (default: 2).")
+    parser.add_argument("--query-chunk-size", type=int, default=1_000_000,
+                        help="Representatives per query invocation (default: 1000000).")
+    parser.add_argument("--query-memory", type=int, default=16, help="GB per query worker (default: 16).")
+    parser.add_argument("--query-hours", type=int, default=48, help="Hours per query worker (default: 48).")
+    parser.add_argument("--_globdb-marker", help=argparse.SUPPRESS)
+    parser.add_argument("--_summary-receipt", help=argparse.SUPPRESS)
+    parser.add_argument("--_summarise", action="store_true", help=argparse.SUPPRESS)
+
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--quiet", action="store_true")
 
@@ -887,6 +1154,14 @@ def main():
     parser.add_argument("--threads", type=int, default=1, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+    for name in ("query_chunk_size", "taxonomy_chunk_size", "query_memory", "query_hours",
+                 "taxonomy_memory", "taxonomy_hours", "stratify_memory", "stratify_hours",
+                 "sort_threads", "taxonomy_threads", "threads"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.query_max_divergence < 0:
+        parser.error("--query-max-divergence must be non-negative")
+    args.query_db = args.query_db or os.path.join(args.metapackage, "new_metapackage.sdb")
 
     level = logging.DEBUG if args.debug else (logging.ERROR if args.quiet else logging.INFO)
     logging.basicConfig(
@@ -894,6 +1169,15 @@ def main():
         format="%(asctime)s %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    if args._globdb_marker:
+        worker_globdb_marker(args.input_dir, args._globdb_marker, args.query_db,
+                             args.singlem_bin, args.smafa_bin_dir,
+                             args.query_max_divergence, args.query_chunk_size)
+        return
+    if args._summarise:
+        worker_summarise(args)
+        return
 
     if args._stratify_marker:
         worker_stratify_marker(
