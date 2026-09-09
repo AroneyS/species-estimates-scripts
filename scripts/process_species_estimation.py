@@ -429,10 +429,51 @@ ARCHIVE_OTU_TABLE_FIELDS = [
 ]
 
 
-def _representatives_to_archive_otu_table(rep_fasta_path, marker_name, archive_path):
+def _iter_representative_batches(rep_fasta_path, batch_size):
     """
-    Stream representatives.fasta -> a minimal SingleM archive OTU table (JSON,
-    version 4), one entry per cluster representative, suitable as
+    Stream representatives.fasta and yield lists of (rep_id, sequence) tuples,
+    each up to batch_size long (the last batch may be shorter).
+
+    Chunking representatives.fasta this way -- rather than converting the
+    whole file to one archive OTU table -- is what keeps memory bounded: see
+    _write_archive_otu_table_batch and the OOM note on worker_taxonomy_marker.
+    """
+    batch = []
+    cur_hdr = None
+    seq_parts = []
+
+    def _flush(hdr, parts):
+        seq = "".join(parts)
+        if hdr is None or not seq:
+            return None
+        rep_id = _representatives_id_from_header(hdr)
+        return (rep_id, seq)
+
+    with open(rep_fasta_path) as in_fh:
+        for line in in_fh:
+            line = line.rstrip("\n")
+            if line.startswith(">"):
+                entry = _flush(cur_hdr, seq_parts)
+                if entry is not None:
+                    batch.append(entry)
+                    if len(batch) >= batch_size:
+                        yield batch
+                        batch = []
+                cur_hdr = line
+                seq_parts = []
+            else:
+                seq_parts.append(line)
+        entry = _flush(cur_hdr, seq_parts)
+        if entry is not None:
+            batch.append(entry)
+    if batch:
+        yield batch
+
+
+def _write_archive_otu_table_batch(batch, marker_name, archive_path):
+    """
+    Write one batch of (rep_id, sequence) tuples as a minimal SingleM archive
+    OTU table (JSON, version 4), suitable as
     `singlem renew --input-archive-otu-table` input.
 
     `renew` (singlem/renew.py) only needs read_names / read_unaligned_sequences
@@ -444,47 +485,19 @@ def _representatives_to_archive_otu_table(rep_fasta_path, marker_name, archive_p
     joined back the same way. alignment_hmm_sha256s/singlem_package_sha256s
     are set to the placeholder "na" -- ArchiveOtuTable.read() never validates
     them (same precedent as singlem/condense.py).
-
-    Written by hand rather than json.dump on an in-memory list, to stay
-    O(1) memory for markers with tens of millions of representatives.
     """
-    n_written = 0
-    with open(rep_fasta_path) as in_fh, open(archive_path, "w") as out_fh:
+    with open(archive_path, "w") as out_fh:
         out_fh.write('{"version": 4, "alignment_hmm_sha256s": "na", '
                      '"singlem_package_sha256s": "na", "fields": ')
         json.dump(ARCHIVE_OTU_TABLE_FIELDS, out_fh)
         out_fh.write(', "otus": [')
-
-        cur_hdr = None
-        seq_parts = []
-        first = True
-
-        def _flush(hdr, parts):
-            nonlocal n_written, first
-            seq = "".join(parts)
-            if hdr is None or not seq:
-                return
-            rep_id = _representatives_id_from_header(hdr)
+        for i, (rep_id, seq) in enumerate(batch):
             row = [marker_name, rep_id, seq, 1, 1.0, "", [rep_id], [len(seq)],
                    False, [seq], [], ""]
-            if not first:
+            if i:
                 out_fh.write(",")
             json.dump(row, out_fh)
-            first = False
-            n_written += 1
-
-        for line in in_fh:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                _flush(cur_hdr, seq_parts)
-                cur_hdr = line
-                seq_parts = []
-            else:
-                seq_parts.append(line)
-        _flush(cur_hdr, seq_parts)
-
         out_fh.write("]}")
-    return n_written
 
 
 def _run_singlem_renew(archive_path, metapackage_dir, results_path, singlem_bin,
@@ -540,10 +553,13 @@ def _load_rep_taxonomy(results_path):
     """
     Return {rep_id: (domain, phylum)} from a renewed archive OTU table.
 
-    Loads the whole JSON document at once (not streamed) -- fine at the
-    scale validated so far (tens of representatives), but for a
-    ~20M-representative marker this could use several GB; not yet measured
-    at that scale (see caveats in the --taxonomy-memory help text).
+    Loads the whole JSON document at once (not streamed) -- fine as long as
+    results_path holds one CHUNK's worth of representatives (see
+    worker_taxonomy_marker), not an entire ~20M-representative marker: a
+    real full-marker attempt OOM-killed singlem renew's own
+    ArchiveOtuTable.read() (also a whole-document json.load, outside this
+    script's control) at a 16GB job memory limit, before renew even started
+    assigning taxonomy.
     """
     with open(results_path) as fh:
         data = json.load(fh)
@@ -561,65 +577,78 @@ def _load_rep_taxonomy(results_path):
     return rep_taxonomy
 
 
-def _tally_taxonomy_histogram(marker_tsv_path, rep_taxonomy):
-    """
-    Join {marker}.tsv's (id, n_samples) against rep_taxonomy (id -> domain,
-    phylum; reps with no hit within max-divergence default to 'NA') and tally
-    counts[(stratum, value, sample_count)] += 1 for stratum in (domain, phylum).
-    """
-    counts = Counter()
-    n_no_hit = 0
+def _load_marker_n_samples(marker_tsv_path):
+    """Return {id: n_samples} for every cluster representative in {marker}.tsv."""
+    n_samples_by_id = {}
     with open(marker_tsv_path, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         if reader.fieldnames is not None and "n_samples" not in reader.fieldnames:
             raise ValueError(f"{marker_tsv_path} has no 'n_samples' column -- cannot summarise.")
         for row in reader:
-            rep_id = row["id"]
-            n_samples = int(row["n_samples"])
-            domain, phylum = rep_taxonomy.get(rep_id, (NA, NA))
-            if rep_id not in rep_taxonomy:
-                n_no_hit += 1
-            counts[("domain", domain, n_samples)] += 1
-            counts[("phylum", phylum, n_samples)] += 1
-    if n_no_hit:
-        logging.info(
-            f"{n_no_hit} cluster(s) had no taxonomy assigned by singlem renew -- "
-            f"tagged domain=NA, phylum=NA."
-        )
-    return counts
+            n_samples_by_id[row["id"]] = int(row["n_samples"])
+    return n_samples_by_id
+
+
+DEFAULT_TAXONOMY_CHUNK_SIZE = 2_000_000
 
 
 def worker_taxonomy_marker(output_dir, marker_name, metapackage_dir, singlem_bin,
-                            smafa_bin_dir, threads=1, tmp_dir=None):
-    """mqsub worker: assign domain/phylum per cluster representative via
-    singlem renew, then tally a stratified sample-count histogram."""
+                            smafa_bin_dir, threads=1, tmp_dir=None,
+                            chunk_size=DEFAULT_TAXONOMY_CHUNK_SIZE):
+    """
+    mqsub worker: assign domain/phylum per cluster representative via
+    singlem renew, then tally a stratified sample-count histogram.
+
+    Processes representatives.fasta in chunks of chunk_size, each as its own
+    renew invocation, rather than one archive OTU table for the whole marker.
+    This is not an optimisation -- a whole-marker attempt on a ~20M-
+    representative marker OOM-killed inside singlem renew's own
+    ArchiveOtuTable.read() (a whole-document json.load, before renew even
+    started assigning taxonomy) at a 16GB job memory limit. Chunking keeps
+    per-invocation memory bounded regardless of marker size; the
+    {marker}.tsv id -> n_samples lookup is still loaded once up front (one
+    dict of scalars, not the much larger archive-OTU-table structure).
+    """
     marker_dir = os.path.join(output_dir, marker_name)
     rep_fasta_path = os.path.join(marker_dir, "representatives.fasta")
     marker_tsv_path = os.path.join(marker_dir, f"{marker_name}.tsv")
     output_path = os.path.join(marker_dir, TAXONOMY_COUNTS_FILENAME)
     tmp_dir = tmp_dir or marker_dir
 
+    logging.info(f"[{marker_name}] Loading n_samples per representative ...")
+    n_samples_by_id = _load_marker_n_samples(marker_tsv_path)
+    logging.info(f"[{marker_name}] Loaded {len(n_samples_by_id)} representative(s).")
+
     archive_path = os.path.join(tmp_dir, f".{marker_name}.rep_archive_otu_table.json")
     results_path = os.path.join(tmp_dir, f".{marker_name}.renew_results.json")
 
+    counts = Counter()
+    n_total = 0
+    n_with_taxonomy = 0
     try:
-        logging.info(f"[{marker_name}] Converting representatives.fasta to an archive OTU table ...")
-        n_reps = _representatives_to_archive_otu_table(rep_fasta_path, marker_name, archive_path)
-        logging.info(f"[{marker_name}] {n_reps} representative(s). Running singlem renew ...")
-        _run_singlem_renew(archive_path, metapackage_dir, results_path,
-                            singlem_bin, smafa_bin_dir, threads)
+        for batch_idx, batch in enumerate(_iter_representative_batches(rep_fasta_path, chunk_size)):
+            logging.info(f"[{marker_name}] Chunk {batch_idx + 1}: {len(batch)} representative(s) ...")
+            _write_archive_otu_table_batch(batch, marker_name, archive_path)
+            _run_singlem_renew(archive_path, metapackage_dir, results_path,
+                                singlem_bin, smafa_bin_dir, threads)
+            rep_taxonomy = _load_rep_taxonomy(results_path)
 
-        logging.info(f"[{marker_name}] Loading renewed taxonomy ...")
-        rep_taxonomy = _load_rep_taxonomy(results_path)
-        logging.info(f"[{marker_name}] {len(rep_taxonomy)}/{n_reps} representative(s) got a taxonomy call.")
-
-        logging.info(f"[{marker_name}] Tallying domain/phylum histogram ...")
-        counts = _tally_taxonomy_histogram(marker_tsv_path, rep_taxonomy)
+            for rep_id, _seq in batch:
+                n_total += 1
+                domain, phylum = rep_taxonomy.get(rep_id, (NA, NA))
+                if rep_id in rep_taxonomy:
+                    n_with_taxonomy += 1
+                n_samples = n_samples_by_id.get(rep_id)
+                if n_samples is None:
+                    continue
+                counts[("domain", domain, n_samples)] += 1
+                counts[("phylum", phylum, n_samples)] += 1
     finally:
         for f in (archive_path, results_path):
             if os.path.exists(f):
                 os.unlink(f)
 
+    logging.info(f"[{marker_name}] {n_with_taxonomy}/{n_total} representative(s) got a taxonomy call.")
     write_histogram(counts, output_path)
     logging.info(f"[{marker_name}] Taxonomy stratified counts written to {output_path}")
 
@@ -740,6 +769,7 @@ def run_orchestrator(args):
                 f" --singlem-bin {args.singlem_bin}"
                 f" --smafa-bin-dir {args.smafa_bin_dir}"
                 f" --threads {args.taxonomy_threads}"
+                f" --taxonomy-chunk-size {args.taxonomy_chunk_size}"
                 for marker_name, _ in pending
             ]
             taxonomy_job_ids = _submit_mqsub_batch(
@@ -817,18 +847,36 @@ def main():
     parser.add_argument("--taxonomy-threads", type=int, default=1, metavar="N",
                          help="Threads for singlem renew (default: 1; unlike singlem query, "
                               "renew's --threads is a real int and safe to raise).")
-    parser.add_argument("--taxonomy-memory", type=int, default=16, metavar="GB",
-                         help="Memory (GB) per taxonomy mqsub job (default: 16, UNVALIDATED at "
-                              "full scale -- only tested with 10 sequences; rep_taxonomy is an "
-                              "in-memory dict that could reach several GB for a ~20M-cluster "
-                              "marker, so watch actual usage on the first real job).")
+    parser.add_argument("--taxonomy-chunk-size", type=int, default=DEFAULT_TAXONOMY_CHUNK_SIZE,
+                         metavar="N",
+                         help="Representatives per singlem renew invocation (default: "
+                              f"{DEFAULT_TAXONOMY_CHUNK_SIZE}). REQUIRED, not just a tuning knob: "
+                              "a whole-marker attempt (~20M representatives for the largest "
+                              "markers) OOM-killed inside singlem renew's own "
+                              "ArchiveOtuTable.read() (a whole-document json.load this script "
+                              "doesn't control) at a 16GB job memory limit, before renew even "
+                              "started assigning taxonomy. Sized to bound the largest marker "
+                              "(~20M reps) to ~10 renew invocations: a live test saw one "
+                              "200-representative chunk take ~112 minutes under cluster "
+                              "contention (vs. ~3.5 min for an identical chunk right after), so "
+                              "with --taxonomy-hours capped at this cluster's 48h maximum, too "
+                              "many small chunks risks the total exceeding the walltime even "
+                              "though no single chunk is slow on its own. Lower this only if "
+                              "chunks OOM at your --taxonomy-memory; each reduction multiplies "
+                              "chunk count and therefore worst-case total time.")
+    parser.add_argument("--taxonomy-memory", type=int, default=32, metavar="GB",
+                         help="Memory (GB) per taxonomy mqsub job (default: 32). A 500K-"
+                              "representative chunk used under 1GB in testing, so 32GB gives "
+                              "headroom at the larger default chunk size above -- but the "
+                              "500K-scale test is the only data point; not confirmed at 2M.")
     parser.add_argument("--taxonomy-hours", type=int, default=48, metavar="H",
-                         help="Walltime (hours) per taxonomy mqsub job (default: 48, "
-                              "UNVALIDATED at full scale -- the one real test took ~33 minutes "
-                              "for 10 representatives, dominated by a fixed-looking cost "
-                              "(loading the metapackage's 59 packages + taxonomy cache) rather "
-                              "than per-representative work, but that's not confirmed at 20M "
-                              "representatives).")
+                         help="Walltime (hours) per taxonomy mqsub job (default: 48 -- this "
+                              "cluster's maximum, not a choice). Per-renew-invocation time has "
+                              "been highly inconsistent in live testing under cluster contention "
+                              "(69s to ~112min for comparable/identical-size inputs), so the "
+                              "worst case for ~10 chunks (see --taxonomy-chunk-size) could still "
+                              "approach this ceiling; there is no larger value available if it "
+                              "doesn't fit.")
 
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--quiet", action="store_true")
@@ -856,7 +904,7 @@ def main():
     if args._taxonomy_marker:
         worker_taxonomy_marker(
             args.input_dir, args._taxonomy_marker, args.metapackage, args.singlem_bin,
-            args.smafa_bin_dir, threads=args.threads,
+            args.smafa_bin_dir, threads=args.threads, chunk_size=args.taxonomy_chunk_size,
         )
         sys.exit(0)
 
