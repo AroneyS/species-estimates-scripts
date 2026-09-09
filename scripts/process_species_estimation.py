@@ -9,10 +9,11 @@
 #    exactly sample_count samples, for each marker and each metadata stratum:
 #      - stratum="all", stratum_value="all": the unstratified count, from
 #        {marker}/{marker}.tsv's n_samples column.
-#      - stratum="year"/"host", stratum_value=<year>/<host or ecological>:
+#      - stratum="year", stratum_value=<year>: cumulative through that year.
+#      - stratum="human_all"/"human_per_year", stratum_value="all"/<year>:
+#        the corresponding analyses restricted to human gut metagenome samples.
 #        recomputed per stratum value by joining clusters.tsv and the
-#        pre-dedup collated FASTA against sample metadata (year,
-#        host_or_not) exported from the sandpiper duckdb.
+#        pre-dedup collated FASTA against sample metadata exported from DuckDB.
 #      - stratum="domain"/"phylum", stratum_value=<taxon>: assigned per
 #        cluster representative by running representatives.fasta through
 #        `singlem renew` against a SingleM metapackage (default: GlobDB_r232).
@@ -23,11 +24,11 @@
 #    remains a CLUSTER histogram; it is not a species-prevalence histogram.
 #
 #    Strata don't sum to the "all" total: a species can appear in samples from
-#    several years (or both host/ecological), so it's counted once per stratum
+#    several years, so it's counted once per stratum
 #    value it appears in, not once overall.
 #
 #    HEAVY STEPS RUN VIA MQSUB, ONE JOB PER MARKER (see run_species_estimation.py
-#    for the same submit/wait pattern): both the year/host recomputation
+#    for the same submit/wait pattern): the cumulative year/human recomputation
 #    (disk-based sort/join over tens-of-GB per-marker files) and the
 #    domain/phylum query are too heavy to run on the login node, so this
 #    script re-invokes itself as an mqsub worker via hidden --_stratify-marker
@@ -299,16 +300,13 @@ def _wait_for_jobs(job_ids):
 # Sample metadata export (from the sandpiper duckdb)
 # ---------------------------------------------------------------------------
 
-def export_sample_metadata(duckdb_path, output_path, host_column="host_or_not_mature"):
-    """Export (acc, year, host_or_not) from the sandpiper duckdb to output_path."""
+def export_sample_metadata(duckdb_path, output_path):
+    """Export (acc, year, organism) from the sandpiper duckdb to output_path."""
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", host_column):
-        raise ValueError("Invalid metadata column name")
     temporary_path = os.path.abspath(output_path) + "." + uuid.uuid4().hex + ".tmp"
     sql_output_path = temporary_path.replace("'", "''")
     query = (
-        "COPY (SELECT m.acc AS acc, a.collection_year AS year, "
-        f"a.{host_column} AS host_or_not "
+        "COPY (SELECT m.acc AS acc, a.collection_year AS year, m.organism AS organism "
         "FROM ncbi_metadata m "
         "LEFT JOIN parsed_sample_attributes a ON a.run_id = m.id) "
         f"TO '{sql_output_path}' (FORMAT CSV, DELIMITER '\\t', HEADER)"
@@ -328,22 +326,22 @@ def export_sample_metadata(duckdb_path, output_path, host_column="host_or_not_ma
 
 
 def load_sample_metadata(tsv_path):
-    """Return {sample_acc: (year_str, host_str)}, missing values mapped to 'NA'."""
+    """Return {sample_acc: (year_str, organism)}, missing values mapped to 'NA'."""
     metadata = {}
     with open(tsv_path) as fh:
         header = fh.readline().rstrip("\n").split("\t")
-        assert header == ["acc", "year", "host_or_not"], f"Unexpected header: {header}"
+        assert header == ["acc", "year", "organism"], f"Unexpected header: {header}"
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             acc = parts[0]
             year = parts[1] if len(parts) > 1 and parts[1] else NA
-            host = parts[2] if len(parts) > 2 and parts[2] else NA
-            metadata[acc] = (year, host)
+            organism = parts[2] if len(parts) > 2 and parts[2] else NA
+            metadata[acc] = (year, organism)
     return metadata
 
 
 # ---------------------------------------------------------------------------
-# Worker: year/host stratified sample counts (disk-based sort/join, O(1) mem)
+# Worker: cumulative year and human-gut stratified counts (disk-based sort/join)
 #
 #   clusters.tsv maps a deduplicated member sequence -> its cluster
 #   representative sequence (both raw sequence text, not IDs).
@@ -358,9 +356,9 @@ def load_sample_metadata(tsv_path):
 #   Pipeline (all via GNU sort/join subprocesses, LC_ALL=C for determinism):
 #     1. sort clusters.tsv by member sequence (col 1).
 #     2. stream collated_fastas/{marker}.fasta -> (sequence, sample, year,
-#        host) tuples (year/host looked up from the small in-memory sample
+#        organism) tuples (year and human classification looked up from metadata
 #        metadata dict -- ~913k rows, trivial), then sort by sequence.
-#     3. join (1) and (2) on sequence -> (rep_seq, sample, year, host) rows,
+#     3. join (1) and (2) on sequence -> (rep_seq, sample, year, organism) rows,
 #        emitting two tagged tuples per row: (rep, "year", <year>, sample)
 #        and (rep, "host", <host>, sample).
 #     4. sort -u the tagged-tuple stream (dedupes a sample contributing
@@ -395,7 +393,7 @@ def _sorted_copy(src_path, dest_path, key_field=1, tmp_dir=None, threads=1):
 def _write_otu_tuples(collated_fasta_path, sample_metadata, out_path):
     """
     Stream collated_fastas/{marker}.fasta and write one line per OTU entry:
-        sequence \t sample \t year \t host
+        sequence \t sample \t year \t organism
     Sequence has '-' replaced with 'N' to match smafa's dash-to-N transform,
     the same way _write_rep_sample_pair does in run_species_estimation.py.
     """
@@ -413,10 +411,10 @@ def _write_otu_tuples(collated_fasta_path, sample_metadata, out_path):
             sample = _parse_sample_from_header(hdr)
             if sample is None:
                 return
-            year, host = sample_metadata.get(sample, (NA, NA))
+            year, organism = sample_metadata.get(sample, (NA, NA))
             if sample not in sample_metadata:
                 n_missing_sample += 1
-            out_fh.write(f"{seq.replace('-', 'N')}\t{sample}\t{year}\t{host}\n")
+            out_fh.write(f"{seq.replace('-', 'N')}\t{sample}\t{year}\t{organism}\n")
             n_written += 1
 
         for line in in_fh:
@@ -432,18 +430,20 @@ def _write_otu_tuples(collated_fasta_path, sample_metadata, out_path):
     if n_missing_sample:
         logging.warning(
             f"{n_missing_sample}/{n_written} OTU entries had a sample accession "
-            f"not found in the sample metadata table (treated as year=NA, host=NA)."
+                f"not found in the sample metadata table (treated as year=NA, organism=NA)."
         )
     return n_written
 
 
-def _join_and_tag(clusters_sorted_path, otu_sorted_path, tagged_path):
+def _join_and_tag(clusters_sorted_path, otu_sorted_path, tagged_path, years,
+                  human_organism="human gut metagenome"):
     """
     join clusters_sorted_path (member_seq \t rep_seq) with otu_sorted_path
-    (seq \t sample \t year \t host) on sequence, then write two tagged rows
+    (seq \t sample \t year \t organism) on sequence, then write cumulative year
+    and human-gut tagged rows
     per match to tagged_path:
         rep_seq \t year \t <year> \t sample
-        rep_seq \t host \t <host> \t sample
+        rep_seq \t human_all|human_per_year \t <value> \t sample
     """
     env = dict(os.environ, LC_ALL="C")
     join_cmd = [
@@ -458,9 +458,20 @@ def _join_and_tag(clusters_sorted_path, otu_sorted_path, tagged_path):
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 5:
                 continue
-            _seq, rep_seq, sample, year, host = parts[0], parts[1], parts[2], parts[3], parts[4]
-            out_fh.write(f"{rep_seq}\tyear\t{year}\t{sample}\n")
-            out_fh.write(f"{rep_seq}\thost\t{host}\t{sample}\n")
+            _seq, rep_seq, sample, year, organism = parts[0], parts[1], parts[2], parts[3], parts[4]
+            if year != NA:
+                try:
+                    year_num = int(year)
+                except ValueError:
+                    year_num = None
+                if year_num is not None:
+                    for cutoff in years:
+                        if year_num <= cutoff:
+                            out_fh.write(f"{rep_seq}\tyear\t{cutoff}\t{sample}\n")
+                            if organism == human_organism:
+                                out_fh.write(f"{rep_seq}\thuman_per_year\t{cutoff}\t{sample}\n")
+            if organism == human_organism:
+                out_fh.write(f"{rep_seq}\thuman_all\tall\t{sample}\n")
             n_rows += 1
         ret = proc.wait()
     if ret != 0:
@@ -525,8 +536,9 @@ def write_histogram(counts, output_path):
                 fh.write(f"{stratum}\t{value}\t{sample_count}\t{species_count}\n")
 
 
-def worker_stratify_marker(output_dir, marker_name, sample_metadata_path, tmp_dir=None, threads=1):
-    """mqsub worker: recompute year/host stratified sample counts for one marker."""
+def worker_stratify_marker(output_dir, marker_name, sample_metadata_path, tmp_dir=None, threads=1,
+                           human_organism="human gut metagenome"):
+    """mqsub worker: compute cumulative year and human-gut counts for one marker."""
     marker_dir = os.path.join(output_dir, marker_name)
     collated_fasta_path = os.path.join(output_dir, "collated_fastas", f"{marker_name}.fasta")
     clusters_path = os.path.join(marker_dir, "clusters.tsv")
@@ -553,7 +565,11 @@ def worker_stratify_marker(output_dir, marker_name, sample_metadata_path, tmp_di
         _sorted_copy(otu_tuples, otu_sorted, key_field=1, tmp_dir=tmp_dir, threads=threads)
 
         logging.info(f"[{marker_name}] Joining clusters <-> OTU tuples on sequence ...")
-        n_joined = _join_and_tag(clusters_sorted, otu_sorted, tagged)
+        years = sorted({int(year) for _sample, (year, _organism) in sample_metadata.items()
+                        if year != NA and year.isdigit()})
+        if not years:
+            raise ValueError("No numeric collection years found in sample metadata")
+        n_joined = _join_and_tag(clusters_sorted, otu_sorted, tagged, years, human_organism)
         if n_joined < n_otus:
             logging.warning(
                 f"[{marker_name}] {n_otus - n_joined}/{n_otus} OTU sequence(s) had no "
@@ -578,7 +594,7 @@ def worker_stratify_marker(output_dir, marker_name, sample_metadata_path, tmp_di
 # ---------------------------------------------------------------------------
 # Worker: domain/phylum stratified counts via `singlem renew`
 #
-#   Domain/phylum, unlike year/host, is a property of the cluster
+#   Domain/phylum, unlike sample/year strata, is a property of the cluster
 #   REPRESENTATIVE itself (one value per cluster) -- no per-sample join is
 #   needed. This runs representatives.fasta through `singlem renew` against a
 #   SingleM metapackage to get a taxonomy string per representative, extracts
@@ -929,18 +945,19 @@ def run_orchestrator(args):
         required_outputs.extend(os.path.join(d, STRATIFIED_COUNTS_FILENAME) for _, d in markers)
         if not os.path.isfile(args.sample_metadata):
             logging.info(f"{args.sample_metadata} not found -- exporting from {args.duckdb} ...")
-            export_sample_metadata(args.duckdb, args.sample_metadata, args.host_column)
+            export_sample_metadata(args.duckdb, args.sample_metadata)
 
         pending = [
             (name, d) for name, d in markers
             if not os.path.isfile(os.path.join(d, STRATIFIED_COUNTS_FILENAME))
         ]
         if pending:
-            logging.info(f"Submitting {len(pending)} year/host stratification job(s) via mqsub ...")
+            logging.info(f"Submitting {len(pending)} year/human stratification job(s) via mqsub ...")
             cmds = [
                 f"python3 {shlex.quote(THIS_SCRIPT_PATH)} {shlex.quote(args.input_dir)}"
                 f" --_stratify-marker {shlex.quote(marker_name)}"
-                f" --sample-metadata {shlex.quote(args.sample_metadata)}"
+        f" --sample-metadata {shlex.quote(args.sample_metadata)}"
+                f" --human-organism {shlex.quote(args.human_organism)}"
                 f" --threads {args.sort_threads}"
                 for marker_name, _ in pending
             ]
@@ -949,7 +966,7 @@ def run_orchestrator(args):
                 threads=args.sort_threads,
             )
         else:
-            logging.info("All markers already have year/host stratified counts.")
+            logging.info("All markers already have year/human stratified counts.")
 
     if not args.skip_taxonomy:
         required_outputs.extend(os.path.join(d, TAXONOMY_COUNTS_FILENAME) for _, d in markers)
@@ -1051,7 +1068,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Summarise a species_estimation output folder into a tidy TSV of "
                      "marker, stratum, stratum_value, sample_count, species_count -- "
-                     "submitting mqsub sub-jobs per marker for the heavy year/host and "
+                     "submitting mqsub sub-jobs per marker for the heavy year/human and "
                      "domain/phylum stratification steps."
     )
     parser.add_argument(
@@ -1064,22 +1081,22 @@ def main():
     parser.add_argument("--markers", nargs="+", metavar="MARKER",
                          help="Restrict processing to these marker names (default: all markers)")
 
-    # --- Year/host stratification ---
+    # --- Cumulative year and human-gut stratification ---
     parser.add_argument("--skip-stratify-metadata", action="store_true",
-                         help="Skip recomputing year/host counts; existing counts are still included.")
+                         help="Skip recomputing year/human counts; existing counts are still included.")
     parser.add_argument("--duckdb", default=DEFAULT_DUCKDB,
                          help="Sandpiper duckdb path, used only if --sample-metadata doesn't "
                               "already exist.")
     parser.add_argument("--sample-metadata", default=DEFAULT_SAMPLE_METADATA,
-                         help="Sample metadata TSV (acc, year, host_or_not); exported from "
+                         help="Sample metadata TSV (acc, year, organism); exported from "
                               "--duckdb if missing.")
-    parser.add_argument("--host-column", default="host_or_not_mature",
-                         help="parsed_sample_attributes column for host_or_not "
-                              "(default: host_or_not_mature).")
+    parser.add_argument("--human-organism", default="human gut metagenome",
+                         help="Exact organism value identifying human gut samples "
+                              "(default: human gut metagenome).")
     parser.add_argument("--stratify-memory", type=int, default=16, metavar="GB",
-                         help="Memory (GB) per year/host stratification mqsub job (default: 16).")
+                         help="Memory (GB) per year/human stratification mqsub job (default: 16).")
     parser.add_argument("--stratify-hours", type=int, default=48, metavar="H",
-                         help="Walltime (hours) per year/host stratification mqsub job (default: 48).")
+                         help="Walltime (hours) per year/human stratification mqsub job (default: 48).")
     parser.add_argument("--sort-threads", type=int, default=4, metavar="N",
                          help="Threads for GNU sort's --parallel in the stratification job (default: 4).")
 
@@ -1181,7 +1198,8 @@ def main():
 
     if args._stratify_marker:
         worker_stratify_marker(
-            args.input_dir, args._stratify_marker, args.sample_metadata, threads=args.threads
+            args.input_dir, args._stratify_marker, args.sample_metadata, threads=args.threads,
+            human_organism=args.human_organism
         )
         sys.exit(0)
 

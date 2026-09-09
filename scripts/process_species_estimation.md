@@ -34,6 +34,12 @@ A representative match does not establish that every cluster member is within
 2 bp of a reference. No match does not by itself establish a novel species.
 
 The sample-count histogram treats each cluster as one species, as requested.
+Standard `year` rows are cumulative: year Y includes samples collected in years
+up to and including Y. Human gut rows use `human_all` for all matching samples
+and `human_per_year` for the same cumulative-by-year analysis.
+By default, samples whose exported `organism` value is exactly `human gut
+metagenome` are treated as human gut samples; use `--human-organism` if the
+metadata uses another label.
 GlobDB distinct-species totals remain a separate reference-matched metric;
 `singlem renew` continues to provide the broader domain/phylum annotations.
 
@@ -58,7 +64,7 @@ identities. Changed inputs/settings invalidate the cache. Reference/input identi
 not content hashes. Reference packages should be treated as immutable.
 Completed markers are reused; interrupted markers restart their query stage.
 Outputs are published atomically and the completion manifest is written last.
-Existing year/host and renew caches still use their original existence-based
+Existing year/human and renew caches still use their original existence-based
 reuse: remove the relevant cached histogram if its inputs or taxonomy settings
 change.
 

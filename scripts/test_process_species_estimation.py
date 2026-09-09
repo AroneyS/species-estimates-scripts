@@ -131,10 +131,16 @@ class ProcessingTests(unittest.TestCase):
             '>otu0|A|gene\nAAAA\n>otu1|A|gene\nCCCC\n>otu0|B|gene\nAAAA\n')
         (self.marker_dir / 'clusters.tsv').write_text('AAAA\tAAAA\nCCCC\tAAAA\n')
         metadata = self.root / 'metadata.tsv'
-        metadata.write_text('acc\tyear\thost_or_not\nA\t2020\thost\nB\t2021\thost\n')
+        metadata.write_text('acc\tyear\torganism\nA\t2020\thuman gut metagenome\nB\t2021\thuman gut metagenome\n')
         m.worker_stratify_marker(str(self.root), self.marker, str(metadata))
         counts = list(m.read_histogram(self.marker_dir / m.STRATIFIED_COUNTS_FILENAME))
-        self.assertCountEqual(counts, [('host', 'host', 2, 1), ('year', '2020', 1, 1), ('year', '2021', 1, 1)])
+        self.assertCountEqual(counts, [
+            ('human_all', 'all', 2, 1),
+            ('human_per_year', '2020', 1, 1),
+            ('human_per_year', '2021', 2, 1),
+            ('year', '2020', 1, 1),
+            ('year', '2021', 2, 1),
+        ])
 
     def test_submission_requires_ids_and_uses_background(self):
         with patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='')):
