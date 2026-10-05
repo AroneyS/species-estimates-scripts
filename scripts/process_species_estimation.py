@@ -50,6 +50,8 @@ import tempfile
 import shlex
 import sqlite3
 import uuid
+import math
+import time
 from contextlib import closing, contextmanager
 from collections import Counter
 
@@ -124,11 +126,22 @@ def globdb_complete(marker_dir, provenance):
     try:
         with open(os.path.join(marker_dir, GLOBDB_MANIFEST)) as fh:
             manifest = json.load(fh)
-        return manifest == {
-            "provenance": provenance,
-            "outputs": [_file_identity(os.path.join(marker_dir, name))
-                        for name in (GLOBDB_MATCHES, GLOBDB_SUMMARY)],
-        }
+        cached = manifest.get("provenance", {})
+        # Compare the settings and input paths that define the query. Output
+        # files are checked separately; filesystem mtimes can change when a
+        # shared filesystem republishes an otherwise identical file.
+        keys = ("schema", "cohort", "representatives", "database", "max_divergence",
+                "max_nearest_neighbours", "singlem", "processor_sha256")
+        for key in keys:
+            left, right = cached.get(key), provenance.get(key)
+            if key in ("database", "singlem") and isinstance(left, list) and isinstance(right, list):
+                left, right = left[0], right[0]
+            elif key == "representatives" and isinstance(left, list) and isinstance(right, list):
+                left, right = left[:2], right[:2]
+            if left != right:
+                return False
+        return all(os.path.isfile(os.path.join(marker_dir, name))
+                   for name in (GLOBDB_MATCHES, GLOBDB_SUMMARY))
     except (OSError, ValueError):
         return False
 
@@ -293,7 +306,14 @@ def _wait_for_jobs(job_ids):
     with tempfile.NamedTemporaryFile(mode="w", prefix="mqwait_", suffix=".ids", dir=os.getcwd()) as f:
         f.write("\n".join(job_ids) + "\n")
         f.flush()
-        subprocess.run(["mqwait", "-i", f.name], check=True)
+        for attempt in range(10):
+            result = subprocess.run(["mqwait", "-i", f.name])
+            if result.returncode == 0:
+                return
+            if attempt == 9:
+                raise subprocess.CalledProcessError(result.returncode, ["mqwait", "-i", f.name])
+            logging.warning("mqwait failed (attempt %d/10); retrying in 30 seconds", attempt + 1)
+            time.sleep(30)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +326,8 @@ def export_sample_metadata(duckdb_path, output_path):
     temporary_path = os.path.abspath(output_path) + "." + uuid.uuid4().hex + ".tmp"
     sql_output_path = temporary_path.replace("'", "''")
     query = (
-        "COPY (SELECT m.acc AS acc, a.collection_year AS year, m.organism AS organism "
+        "COPY (SELECT m.acc AS acc, a.collection_year AS year, "
+        "m.taxon_name AS organism "
         "FROM ncbi_metadata m "
         "LEFT JOIN parsed_sample_attributes a ON a.run_id = m.id) "
         f"TO '{sql_output_path}' (FORMAT CSV, DELIMITER '\\t', HEADER)"
@@ -691,8 +712,11 @@ def _write_archive_otu_table_batch(batch, marker_name, archive_path):
                      '"singlem_package_sha256s": "na", "fields": ')
         json.dump(ARCHIVE_OTU_TABLE_FIELDS, out_fh)
         out_fh.write(', "otus": [')
+        # One sample per batch is critical: SingleM otherwise creates one
+        # temporary FASTA/DIAMOND run per representative.
+        sample_name = "taxonomy_batch"
         for i, (rep_id, seq) in enumerate(batch):
-            row = [marker_name, rep_id, seq, 1, 1.0, "", [rep_id], [len(seq)],
+            row = [marker_name, sample_name, seq, 1, 1.0, "", [rep_id], [len(seq)],
                    False, [seq], [], ""]
             if i:
                 out_fh.write(",")
@@ -769,7 +793,10 @@ def _load_rep_taxonomy(results_path):
 
     rep_taxonomy = {}
     for row in data["otus"]:
-        rep_id = row[sample_idx]
+        # Representative IDs are carried in read_names; sample is shared by
+        # all representatives in a batch to let SingleM group the work.
+        read_names = row[fields.index("read_names")]
+        rep_id = read_names[0] if read_names else row[sample_idx]
         taxonomy = row[taxonomy_idx] or ""
         domain = _parse_taxonomy_token(taxonomy, "d__")
         phylum = _parse_taxonomy_token(taxonomy, "p__")
@@ -794,7 +821,8 @@ DEFAULT_TAXONOMY_CHUNK_SIZE = 2_000_000
 
 def worker_taxonomy_marker(output_dir, marker_name, metapackage_dir, singlem_bin,
                             smafa_bin_dir, threads=1, tmp_dir=None,
-                            chunk_size=DEFAULT_TAXONOMY_CHUNK_SIZE):
+                            chunk_size=DEFAULT_TAXONOMY_CHUNK_SIZE,
+                            chunk_index=None, chunk_output_path=None):
     """
     mqsub worker: assign domain/phylum per cluster representative via
     singlem renew, then tally a stratified sample-count histogram.
@@ -819,14 +847,22 @@ def worker_taxonomy_marker(output_dir, marker_name, metapackage_dir, singlem_bin
     n_samples_by_id = _load_marker_n_samples(marker_tsv_path)
     logging.info(f"[{marker_name}] Loaded {len(n_samples_by_id)} representative(s).")
 
-    archive_path = os.path.join(tmp_dir, f".{marker_name}.rep_archive_otu_table.json")
-    results_path = os.path.join(tmp_dir, f".{marker_name}.renew_results.json")
+    # Batch workers for one marker run concurrently. Their temporary archive
+    # and result paths must therefore be unique; otherwise workers overwrite
+    # or delete one another's inputs.
+    batch_suffix = "" if chunk_index is None else f".chunk-{chunk_index:05d}"
+    archive_path = os.path.join(
+        tmp_dir, f".{marker_name}{batch_suffix}.rep_archive_otu_table.json")
+    results_path = os.path.join(
+        tmp_dir, f".{marker_name}{batch_suffix}.renew_results.json")
 
     counts = Counter()
     n_total = 0
     n_with_taxonomy = 0
     try:
         for batch_idx, batch in enumerate(_iter_representative_batches(rep_fasta_path, chunk_size)):
+            if chunk_index is not None and batch_idx != chunk_index:
+                continue
             logging.info(f"[{marker_name}] Chunk {batch_idx + 1}: {len(batch)} representative(s) ...")
             _write_archive_otu_table_batch(batch, marker_name, archive_path)
             _run_singlem_renew(archive_path, metapackage_dir, results_path,
@@ -849,8 +885,8 @@ def worker_taxonomy_marker(output_dir, marker_name, metapackage_dir, singlem_bin
                 os.unlink(f)
 
     logging.info(f"[{marker_name}] {n_with_taxonomy}/{n_total} representative(s) got a taxonomy call.")
-    write_histogram(counts, output_path)
-    logging.info(f"[{marker_name}] Taxonomy stratified counts written to {output_path}")
+    write_histogram(counts, chunk_output_path or output_path)
+    logging.info(f"[{marker_name}] Taxonomy stratified counts written to {chunk_output_path or output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -975,21 +1011,74 @@ def run_orchestrator(args):
             if not os.path.isfile(os.path.join(d, TAXONOMY_COUNTS_FILENAME))
         ]
         if pending:
-            logging.info(f"Submitting {len(pending)} domain/phylum taxonomy job(s) via mqsub ...")
-            cmds = [
-                f"python3 {shlex.quote(THIS_SCRIPT_PATH)} {shlex.quote(args.input_dir)}"
-                f" --_taxonomy-marker {shlex.quote(marker_name)}"
-                f" --metapackage {shlex.quote(args.metapackage)}"
-                f" --singlem-bin {shlex.quote(args.singlem_bin)}"
-                f" --smafa-bin-dir {shlex.quote(args.smafa_bin_dir)}"
-                f" --threads {args.taxonomy_threads}"
-                f" --taxonomy-chunk-size {args.taxonomy_chunk_size}"
-                for marker_name, _ in pending
-            ]
+            cmds = []
+            for marker_name, marker_dir in pending:
+                chunk_dir = os.path.join(marker_dir, ".taxonomy_chunks")
+                os.makedirs(chunk_dir, exist_ok=True)
+                # The existing summary gives the representative count without
+                # rescanning every multi-gigabyte FASTA on the login node.
+                summary_path = os.path.join(args.input_dir, "summary.tsv")
+                n_reps = None
+                if os.path.isfile(summary_path):
+                    with open(summary_path, newline="") as sf:
+                        for row in csv.DictReader(sf, delimiter="\t"):
+                            if row.get("marker") == marker_name:
+                                n_reps = int(row["num_clusters"])
+                                break
+                if n_reps is None:
+                    with open(os.path.join(marker_dir, f"{marker_name}.tsv"), newline="") as mf:
+                        n_reps = sum(1 for _ in mf) - 1
+                n_chunks = math.ceil(n_reps / args.taxonomy_chunk_size)
+                for chunk_index in range(n_chunks):
+                    chunk_path = os.path.join(chunk_dir, f"chunk-{chunk_index:05d}.tsv")
+                    if os.path.isfile(chunk_path):
+                        continue
+                    cmds.append(
+                        f"python3 {shlex.quote(THIS_SCRIPT_PATH)} {shlex.quote(args.input_dir)}"
+                        f" --_taxonomy-marker {shlex.quote(marker_name)}"
+                        f" --taxonomy-chunk-index {chunk_index}"
+                        f" --taxonomy-chunk-output {shlex.quote(chunk_path)}"
+                        f" --metapackage {shlex.quote(args.metapackage)}"
+                        f" --singlem-bin {shlex.quote(args.singlem_bin)}"
+                        f" --smafa-bin-dir {shlex.quote(args.smafa_bin_dir)}"
+                        " --threads 1"
+                        f" --taxonomy-chunk-size {args.taxonomy_chunk_size}"
+                    )
+            logging.info(f"Submitting {len(cmds)} domain/phylum taxonomy batch job(s) via mqsub ...")
             taxonomy_job_ids = _submit_mqsub_batch(
                 cmds, "taxonomy_renew", args.taxonomy_memory, args.taxonomy_hours,
-                threads=args.taxonomy_threads,
+                # Taxonomy jobs are intentionally one-CPU jobs; extra CPUs do
+                # not accelerate the nucleotide query and increase queue cost.
+                threads=1,
             )
+            # Merge only after all independently checkpointed batches finish.
+            _wait_for_jobs(taxonomy_job_ids)
+            for marker_name, marker_dir in pending:
+                chunk_dir = os.path.join(marker_dir, ".taxonomy_chunks")
+                chunk_paths = sorted(os.path.join(chunk_dir, p) for p in os.listdir(chunk_dir)
+                                     if p.startswith("chunk-") and p.endswith(".tsv"))
+                summary_path = os.path.join(args.input_dir, "summary.tsv")
+                n_reps = None
+                if os.path.isfile(summary_path):
+                    with open(summary_path, newline="") as sf:
+                        for row in csv.DictReader(sf, delimiter="\t"):
+                            if row.get("marker") == marker_name:
+                                n_reps = int(row["num_clusters"])
+                                break
+                if n_reps is None:
+                    with open(os.path.join(marker_dir, f"{marker_name}.tsv"), newline="") as mf:
+                        n_reps = sum(1 for _ in mf) - 1
+                expected_chunks = math.ceil(n_reps / args.taxonomy_chunk_size)
+                if len(chunk_paths) != expected_chunks:
+                    raise RuntimeError(
+                        f"Only {len(chunk_paths)}/{expected_chunks} taxonomy batch outputs for {marker_name}; "
+                        "refusing to publish an incomplete taxonomy table")
+                merged = Counter()
+                for path in chunk_paths:
+                    for stratum, value, sample_count, species_count in read_histogram(path):
+                        merged[(stratum, value, sample_count)] += species_count
+                write_histogram(merged, os.path.join(marker_dir, TAXONOMY_COUNTS_FILENAME))
+            taxonomy_job_ids = []
         else:
             logging.info("All markers already have domain/phylum stratified counts.")
 
@@ -1118,19 +1207,19 @@ def main():
     parser.add_argument("--taxonomy-threads", type=int, default=1, metavar="N",
                          help="Threads for singlem renew (default: 1; unlike singlem query, "
                               "renew's --threads is a real int and safe to raise).")
-    parser.add_argument("--taxonomy-chunk-size", type=int, default=DEFAULT_TAXONOMY_CHUNK_SIZE,
+    parser.add_argument("--taxonomy-chunk-size", type=int, default=500_000,
                          metavar="N",
-                         help="Representatives per singlem renew invocation (default: "
-                              f"{DEFAULT_TAXONOMY_CHUNK_SIZE}). REQUIRED, not just a tuning knob: "
+                         help="Representatives per independent taxonomy job (default: 500000). "
+                              "Each completed batch is checkpointed and can be resumed: "
                               "a whole-marker attempt (~20M representatives for the largest "
                               "markers) OOM-killed inside singlem renew's own "
                               "ArchiveOtuTable.read() (a whole-document json.load this script "
                               "doesn't control) at a 16GB job memory limit, before renew even "
                               "started assigning taxonomy. Sized to bound the largest marker "
-                              "(~20M reps) to ~10 renew invocations: a live test saw one "
+                              "(~20M reps) to ~40 renew invocations: a live test saw one "
                               "200-representative chunk take ~112 minutes under cluster "
                               "contention (vs. ~3.5 min for an identical chunk right after), so "
-                              "with --taxonomy-hours capped at this cluster's 48h maximum, too "
+                              "with --taxonomy-hours set to 24h by default, too "
                               "many small chunks risks the total exceeding the walltime even "
                               "though no single chunk is slow on its own. Lower this only if "
                               "chunks OOM at your --taxonomy-memory; each reduction multiplies "
@@ -1140,8 +1229,8 @@ def main():
                               "representative chunk used under 1GB in testing, so 32GB gives "
                               "headroom at the larger default chunk size above -- but the "
                               "500K-scale test is the only data point; not confirmed at 2M.")
-    parser.add_argument("--taxonomy-hours", type=int, default=48, metavar="H",
-                         help="Walltime (hours) per taxonomy mqsub job (default: 48 -- this "
+    parser.add_argument("--taxonomy-hours", type=int, default=24, metavar="H",
+                         help="Walltime (hours) per taxonomy mqsub job (default: 24; "
                               "cluster's maximum, not a choice). Per-renew-invocation time has "
                               "been highly inconsistent in live testing under cluster contention "
                               "(69s to ~112min for comparable/identical-size inputs), so the "
@@ -1168,6 +1257,8 @@ def main():
     # --- Internal: used only when this script is re-invoked as an mqsub worker ---
     parser.add_argument("--_stratify-marker", metavar="NAME", help=argparse.SUPPRESS)
     parser.add_argument("--_taxonomy-marker", metavar="NAME", help=argparse.SUPPRESS)
+    parser.add_argument("--taxonomy-chunk-index", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--taxonomy-chunk-output", help=argparse.SUPPRESS)
     parser.add_argument("--threads", type=int, default=1, help=argparse.SUPPRESS)
 
     args = parser.parse_args()
@@ -1204,9 +1295,12 @@ def main():
         sys.exit(0)
 
     if args._taxonomy_marker:
+        if args.taxonomy_chunk_index is not None and args.taxonomy_chunk_index < 0:
+            parser.error("--taxonomy-chunk-index must be non-negative")
         worker_taxonomy_marker(
             args.input_dir, args._taxonomy_marker, args.metapackage, args.singlem_bin,
             args.smafa_bin_dir, threads=args.threads, chunk_size=args.taxonomy_chunk_size,
+            chunk_index=args.taxonomy_chunk_index, chunk_output_path=args.taxonomy_chunk_output,
         )
         sys.exit(0)
 

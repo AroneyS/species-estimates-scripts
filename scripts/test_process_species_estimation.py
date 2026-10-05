@@ -186,6 +186,18 @@ class ProcessingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(m._iter_representative_batches(self.fasta, 0))
 
+    def test_metadata_export_uses_organism_from_sample_attributes(self):
+        output = self.root / "metadata.tsv"
+        result = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with patch.object(m.subprocess, "run", return_value=result) as run, \
+                patch.object(m.os, "replace"):
+            m.export_sample_metadata("database.duckdb", str(output))
+        command = run.call_args.args[0]
+        query = command[command.index("-c") + 1]
+        self.assertIn("m.taxon_name AS organism", query)
+        self.assertNotIn("biosample_attributes", query)
+        self.assertNotIn("m.organism", query)
+
 
 if __name__ == '__main__':
     unittest.main()

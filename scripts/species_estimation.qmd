@@ -12,13 +12,16 @@ execute:
 ```{r setup}
 #! include: false
 
+library(breakaway)
 library(treemapify)
 library(cowplot)
 library(tidyverse)
 library(here)
 
-output_dir <- here("results", "species_estimation_qmd", "20260713")
+output_dir <- here("results", "species_estimation_qmd", "20260909")
 dir.create(output_dir, recursive = TRUE)
+
+set.seed(42)
 
 # Colour Brewer paired palette
 colour_brewer <- setNames(append(as.list(RColorBrewer::brewer.pal(12, "Paired")), c("#737373", "#FFFFFF", "#000000")), c("blue", "darkblue", "green", "darkgreen", "red", "darkred", "orange", "darkorange", "purple", "darkpurple", "yellow", "brown", "grey", "white", "black"))
@@ -34,13 +37,12 @@ cluster_type_levels <- c("genome_linked", "multi_sample", "multi_hit", "single_s
 ```
 
 ```{r wrangling}
-if (file.exists(here(output_dir, "wrangling.RData"))) {
-  load(here(output_dir, "wrangling.RData"))
+input_dir <- here("results", "species_estimation", "20260704")
+wrangling_path <- here(output_dir, "wrangling.RData")
+if (file.exists(wrangling_path)) {
+  load(wrangling_path)
   print("Using prior wrangling")
 } else {
-
-  input_dir <- here("results", "species_estimation", "20260704")
-
   summary <- read_tsv(here(input_dir, "summary.tsv"))
 
   cluster_summary <- tibble(
@@ -49,14 +51,21 @@ if (file.exists(here(output_dir, "wrangling.RData"))) {
     filter(str_detect(marker, "^S3.")) %>%
     mutate(
       tsv_path = here(input_dir, marker, str_c(marker, ".tsv")),
-      data = map(tsv_path, ~
-        read_tsv(.) %>%
+      data = map(tsv_path, function(path) {
+        marker_name <- basename(dirname(path))
+        read_tsv(path) %>%
+        left_join(
+          read_tsv(here(input_dir, marker_name, "globdb_matches.tsv"),
+                   show_col_types = FALSE,
+                   col_select = c(id, globdb_status)),
+          by = "id"
+        ) %>%
         mutate(
           # rep_status = factor(unknown, levels = c(0, 1), labels = c("GlobDB", "unknown")),
           # rep_hits = hits,
           # cluster_n = cluster_size,
           cluster_samples = n_samples,
-          cluster_status = n_query > 0,
+          cluster_status = globdb_status == "confirmed",
           cluster_status = factor(cluster_status, levels = c(TRUE, FALSE), labels = c("GlobDB", "unknown")),
           # cluster_max_hits = max_hits,
           cluster_total_hits = total_hits,
@@ -78,12 +87,58 @@ if (file.exists(here(output_dir, "wrangling.RData"))) {
           total_hits_median = median(cluster_total_hits),
           .groups = "drop"
           )
-      ),
+      }),
     ) %>%
     select(-c(tsv_path)) %>%
     unnest(data)
 
-  save.image(here(output_dir, "wrangling.RData"))
+  processed_summary_path <- here(input_dir, "species_count_complete.tsv")
+  cumulative_year <- read_tsv(processed_summary_path, show_col_types = FALSE) %>%
+    filter(stratum %in% c("year", "human_per_year")) %>%
+    group_by(marker, stratum, stratum_value) %>%
+    summarise(species = sum(species_count), .groups = "drop") %>%
+    transmute(marker,
+              cohort = if_else(stratum == "year", "all", "human-gut"),
+              year = as.integer(stratum_value), species)
+
+  save.image(wrangling_path)
+}
+
+#-------------------------------------------------------------------------------
+#--- Sample-by-cluster incidence data for rarefaction curves
+#-------------------------------------------------------------------------------
+# Build a sample-by-cluster incidence table for the rarefaction and cumulative
+# plots.  The processing pipeline treats each cluster as one species.
+incidence_path <- here(output_dir, "sample_cluster_incidence.RData")
+if (file.exists(incidence_path)) {
+  load(incidence_path)
+} else {
+  metadata_path <- here("results", "sample_metadata", "sandpiper_39_sample_metadata_with_organism.tsv")
+  sample_metadata <- read_tsv(metadata_path, show_col_types = FALSE) %>%
+    transmute(sample = acc, year = suppressWarnings(as.integer(year)), organism)
+
+  read_marker_incidence <- function(marker) {
+    cluster_path <- here(input_dir, marker, "clusters.tsv")
+    fasta_path <- here(input_dir, "collated_fastas", str_c(marker, ".fasta"))
+    clusters <- read_tsv(cluster_path, col_names = c("member", "species"),
+                         show_col_types = FALSE, progress = FALSE) %>%
+      mutate(member = str_replace_all(member, "-", "N")) %>% distinct()
+    lines <- readLines(fasta_path)
+    headers <- which(str_starts(lines, ">"))
+    end <- c(headers[-1] - 1L, length(lines))
+    tibble(
+      sample = map_chr(seq_along(headers), ~ str_split(lines[headers[.x]], "\\|", simplify = TRUE)[2]),
+      sequence = map2_chr(headers, end, ~ str_replace_all(paste0(lines[(.x + 1L):.y], collapse = ""), "-", "N"))
+    ) %>%
+      left_join(clusters, by = c("sequence" = "member")) %>%
+      filter(!is.na(species)) %>% distinct(sample, species)
+  }
+
+  incidence <- map_dfr(cluster_summary$marker %>% unique(), ~
+    read_marker_incidence(.x) %>% mutate(marker = .x)) %>%
+    left_join(sample_metadata, by = "sample")
+
+  save(incidence, sample_metadata, file = incidence_path)
 }
 ```
 
@@ -178,4 +233,145 @@ cluster_summary %>%
   theme_cowplot() +
   theme(legend.position = "none")
 ggsave(here(output_dir, "cluster_type_treemap.png"), width = 12, height = 12, dpi = 600)
+
+#-------------------------------------------------------------------------------
+#--- Sample rarefaction and cumulative-year figures
+#-------------------------------------------------------------------------------
+# Species accumulation as a function of the fraction of samples included.
+# Ten random permutations at each fraction provide a light uncertainty band.
+rarefaction <- function(x, cohort_name, fractions = seq(.1, 1, .1), replicates = 10) {
+  samples <- x %>% filter(cohort == cohort_name) %>% distinct(sample) %>% pull(sample)
+  if (!length(samples)) return(tibble())
+  map_dfr(fractions, function(fraction) {
+    n <- max(1L, ceiling(length(samples) * fraction))
+    map_dfr(seq_len(replicates), function(rep) {
+      selected <- sample(samples, n)
+      tibble(fraction = fraction, replicate = rep,
+             species = n_distinct(x$species[x$sample %in% selected]))
+    })
+  }) %>% mutate(cohort = cohort_name)
+}
+
+incidence_cohorts <- incidence %>%
+  mutate(cohort = if_else(organism == "human gut metagenome", "human-gut", "all"))
+rarefaction_data <- map_dfr(sort(unique(incidence_cohorts$marker)), function(marker_name) {
+  x <- filter(incidence_cohorts, marker == marker_name)
+  bind_rows(rarefaction(x, "all"), rarefaction(x, "human-gut")) %>%
+    mutate(marker = marker_name)
+})
+
+rarefaction_plot <- rarefaction_data %>%
+  group_by(marker, cohort, fraction) %>%
+  summarise(mean_species = mean(species),
+            lower = quantile(species, .025), upper = quantile(species, .975), .groups = "drop") %>%
+  ggplot(aes(fraction, mean_species, colour = cohort, fill = cohort)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = .18, colour = NA) +
+  geom_line(linewidth = .7) +
+  facet_wrap(~ marker, scales = "free_y") +
+  scale_x_continuous(labels = scales::percent, breaks = seq(.1, 1, .1)) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  labs(x = "Fraction of samples", y = "Species observed", colour = NULL, fill = NULL) +
+  theme_cowplot() + theme(legend.position = "bottom")
+ggsave(here(output_dir, "sample_rarefaction.png"), rarefaction_plot,
+       width = 14, height = 9, dpi = 300)
+
+cumulative_year_plot <- cumulative_year %>%
+  ggplot(aes(year, species, colour = cohort)) +
+  geom_line(linewidth = .7) + geom_point(size = 1) +
+  facet_wrap(~ marker, scales = "free_y") +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  labs(x = "Collection year (cumulative through year)", y = "Species observed", colour = NULL) +
+  theme_cowplot() + theme(legend.position = "bottom")
+ggsave(here(output_dir, "cumulative_year_species.png"), cumulative_year_plot,
+       width = 14, height = 9, dpi = 300)
+```
+
+```{r richness}
+#-------------------------------------------------------------------------------
+#--- Richness estimates for all samples and human-gut samples
+#-------------------------------------------------------------------------------
+richness_input <- read_tsv(processed_summary_path, show_col_types = FALSE)
+richness_markers <- sort(unique(richness_input$marker))
+
+get_frequency_table <- function(marker_name, cohort_name) {
+  stratum_name <- if (cohort_name == "all") "all" else "human_all"
+  richness_input %>%
+    filter(marker == marker_name, stratum == stratum_name,
+           stratum_value == "all") %>%
+    select(sample_count, species_count) %>%
+    rename(frequency = sample_count, count = species_count) %>%
+    arrange(frequency)
+}
+
+run_richness_method <- function(marker_name, cohort_name, method) {
+  frequencies <- get_frequency_table(marker_name, cohort_name)
+  if (!nrow(frequencies)) return(tibble())
+  estimate <- method(frequencies)
+  tibble(
+    marker = marker_name,
+    cohort = cohort_name,
+    estimate = unname(estimate$estimate),
+    error = if (!is.null(estimate$error)) unname(estimate$error) else NA_real_,
+    model = if (!is.null(estimate$model)) as.character(estimate$model) else NA_character_
+  )
+}
+
+richness_results <- map_dfr(c("all", "human-gut"), function(cohort_name) {
+  map_dfr(richness_markers, function(marker_name) {
+    frequencies <- get_frequency_table(marker_name, cohort_name)
+    if (!nrow(frequencies)) return(tibble())
+    breakaway_result <- breakaway(frequencies)
+    sample_result <- sample_richness(frequencies)
+    nof1_result <- breakaway_nof1(frequencies)
+    f1 <- frequencies$count[frequencies$frequency == 1]
+    f2 <- frequencies$count[frequencies$frequency == 2]
+    f3 <- frequencies$count[frequencies$frequency == 3]
+    tibble(
+      marker = marker_name,
+      cohort = cohort_name,
+      breakaway_estimate = unname(breakaway_result$estimate),
+      breakaway_error = unname(breakaway_result$error),
+      breakaway_model = as.character(breakaway_result$model),
+      observed_estimate = unname(sample_result$estimate),
+      nof1_estimate = unname(nof1_result$estimate),
+      nof1_error = unname(nof1_result$error),
+      nof1_model = as.character(nof1_result$model),
+      f1_f2_ratio = if (length(f1) && length(f2) && f2 != 0) f1 / f2 else NA_real_,
+      f2_f3_ratio = if (length(f2) && length(f3) && f3 != 0) f2 / f3 else NA_real_
+    )
+  })
+})
+
+write_tsv(richness_results, here(output_dir, "richness_estimates.tsv"))
+
+richness_plot_data <- richness_results %>%
+  select(marker, cohort, breakaway_estimate, breakaway_error,
+         observed_estimate, nof1_estimate, nof1_error) %>%
+  pivot_longer(
+    cols = -c(marker, cohort),
+    names_to = c("method", ".value"),
+    names_pattern = "(.*)_(estimate|error)"
+  ) %>%
+  mutate(method = recode(
+    method,
+    breakaway = "Estimated total",
+    observed = "Observed",
+    nof1 = "Estimated total (singletons excluded)"
+  ))
+
+richness_plot <- richness_plot_data %>%
+  ggplot(aes(x = marker, y = estimate, colour = method)) +
+  geom_point(position = position_dodge(width = .6), size = 1.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, estimate - error), ymax = estimate + error),
+    position = position_dodge(width = .6), width = .2,
+    na.rm = TRUE
+  ) +
+  facet_wrap(~ cohort, scales = "free_y") +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  labs(x = "Marker", y = "Richness estimate", colour = "Method") +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+ggsave(here(output_dir, "richness_estimates.png"), richness_plot,
+       width = 15, height = 9, dpi = 300)
 ```

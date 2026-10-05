@@ -12,6 +12,10 @@ The query uses nucleotide `smafa-naive`, `--preload-db`, a maximum divergence of
 inside one single-CPU job per marker; default resources are 16 GB / 48 hours.
 This default batch size has not been validated in a full production run.
 
+The organism-aware sample metadata export uses the dedicated
+`ncbi_metadata.taxon_name` column. The `biosample_attributes` key/value table
+contains additional annotations, but is not needed for this organism filter.
+
 Outputs:
 
 - `<marker>/globdb_matches.tsv`: one row per representative, with its ID,
