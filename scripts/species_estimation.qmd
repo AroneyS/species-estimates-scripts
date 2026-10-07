@@ -763,3 +763,60 @@ globdb_figure <- plot_grid(
 ggsave(here(output_dir, "globdb_summary.png"), globdb_figure,
        width = 14, height = 10, dpi = 300, bg = "white")
 ```
+
+```{r frequency_ratios}
+#-------------------------------------------------------------------------------
+#--- Ratios of species seen in 1/2 and 2/3 samples (f1/f2, f2/f3)
+#-------------------------------------------------------------------------------
+# Higher ratios mean more species seen only rarely, i.e. sampling is further
+# from saturation. One value per marker in each group.
+frequency_ratios <- bind_rows(
+    richness_input %>%
+      filter(stratum %in% c("all", "human_all"), stratum_value == "all") %>%
+      transmute(marker, section = "Cohort",
+                group = if_else(stratum == "all", "All", "Human gut"),
+                sample_count, species_count),
+    domain_counts %>%
+      filter(domain != "Unassigned") %>%
+      transmute(marker, section = "Domain", group = as.character(domain),
+                sample_count, species_count),
+    phylum_counts %>%
+      filter(phylum %in% top_phyla) %>%
+      transmute(marker, section = "Phylum", group = phylum, sample_count, species_count)
+  ) %>%
+  group_by(section, group, marker) %>%
+  summarise(f1 = sum(species_count[sample_count == 1]),
+            f2 = sum(species_count[sample_count == 2]),
+            f3 = sum(species_count[sample_count == 3]),
+            .groups = "drop") %>%
+  mutate(`f1 / f2` = if_else(f2 > 0, f1 / f2, NA_real_),
+         `f2 / f3` = if_else(f3 > 0, f2 / f3, NA_real_))
+write_tsv(frequency_ratios, here(output_dir, "frequency_ratios.tsv"))
+
+# Median and range across markers
+frequency_ratios %>%
+  group_by(section, group) %>%
+  summarise(across(c(`f1 / f2`, `f2 / f3`),
+                   list(median = ~ median(.x, na.rm = TRUE),
+                        min = ~ min(.x, na.rm = TRUE),
+                        max = ~ max(.x, na.rm = TRUE))),
+            .groups = "drop") %>%
+  arrange(section, desc(`f1 / f2_median`)) %>%
+  print(n = Inf)
+
+ratio_group_levels <- c("All", "Human gut", domain_levels, top_phyla)
+frequency_ratio_plot <- frequency_ratios %>%
+  pivot_longer(c(`f1 / f2`, `f2 / f3`), names_to = "ratio", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(section = factor(section, levels = c("Cohort", "Domain", "Phylum")),
+         group = factor(group, levels = rev(ratio_group_levels))) %>%
+  ggplot(aes(value, group)) +
+  geom_boxplot(outlier.shape = NA, colour = "grey50") +
+  geom_point(size = .8, alpha = .6, position = position_jitter(height = .15, seed = 42)) +
+  facet_grid(section ~ ratio, scales = "free", space = "free_y") +
+  labs(x = "Ratio (one point per marker)", y = NULL) +
+  theme_cowplot() +
+  theme(strip.text.y = element_text(angle = 0))
+ggsave(here(output_dir, "frequency_ratios.png"), frequency_ratio_plot,
+       width = 10, height = 10, dpi = 300, bg = "white")
+```
