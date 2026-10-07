@@ -481,3 +481,285 @@ summary_figure <- plot_grid(
 ggsave(here(output_dir, "summary_figure.png"), summary_figure,
        width = 16, height = 12, dpi = 300, bg = "white")
 ```
+
+```{r domain}
+#-------------------------------------------------------------------------------
+#--- Domain stratum: clusters assigned by singlem renew (GlobDB_r232)
+#-------------------------------------------------------------------------------
+# Every cluster has one domain, so domains partition the "all" stratum.
+# Unassigned clusters had no domain-level assignment.
+domain_levels <- c("Bacteria", "Archaea", "Unassigned")
+domain_colours <- setNames(bright_colours[c(1, 2, 7)], domain_levels)
+
+domain_counts <- richness_input %>%
+  filter(stratum == "domain") %>%
+  mutate(domain = coalesce(str_remove(stratum_value, "^d__"), "Unassigned"),
+         domain = if_else(domain == "Eukaryota", "Unassigned", domain),
+         domain = factor(domain, levels = domain_levels)) %>%
+  group_by(marker, domain, sample_count) %>%
+  summarise(species_count = sum(species_count), .groups = "drop")
+
+domain_totals <- domain_counts %>%
+  group_by(marker, domain) %>%
+  summarise(species = sum(species_count), .groups = "drop") %>%
+  complete(marker, domain, fill = list(species = 0)) %>%
+  group_by(marker) %>%
+  mutate(prop = species / sum(species)) %>%
+  ungroup()
+write_tsv(domain_totals, here(output_dir, "domain_totals.tsv"))
+
+domain_composition_plot <- domain_totals %>%
+  pivot_longer(c(species, prop), names_to = "metric", values_to = "value") %>%
+  mutate(marker = marker_label(marker),
+         metric = recode(metric, species = "Species observed", prop = "Proportion")) %>%
+  ggplot(aes(marker, value, fill = domain)) +
+  geom_col() +
+  facet_wrap(~ metric, scales = "free_x") +
+  scale_fill_manual(values = domain_colours) +
+  scale_y_continuous(labels = short_number) +
+  coord_flip() +
+  labs(x = "Marker", y = NULL, fill = "Domain") +
+  theme_cowplot() + theme(legend.position = "bottom")
+ggsave(here(output_dir, "domain_composition.png"), domain_composition_plot,
+       width = 12, height = 6, dpi = 300)
+
+# Richness per domain; unassigned clusters are not estimated.
+domain_richness <- domain_counts %>%
+  filter(domain %in% c("Bacteria", "Archaea")) %>%
+  group_by(marker, domain) %>%
+  group_modify(function(x, key) {
+    frequencies <- x %>%
+      transmute(frequency = sample_count, count = species_count) %>%
+      arrange(frequency)
+    fit <- breakaway(frequencies)
+    tibble(
+      method = c("Estimated total", "Observed"),
+      estimate = c(unname(fit$estimate), sum(frequencies$count)),
+      error = c(unname(fit$error), NA_real_),
+      model = c(as.character(fit$model), NA_character_)
+    )
+  }) %>%
+  ungroup()
+write_tsv(domain_richness, here(output_dir, "domain_richness_estimates.tsv"))
+
+domain_richness_no_kemp <- domain_richness %>% filter(is.na(model) | model != "Kemp")
+
+domain_richness_plot <- domain_richness_no_kemp %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(marker, estimate, colour = method)) +
+  geom_point(position = position_dodge(width = .6), size = 1.8) +
+  geom_errorbar(
+    aes(ymin = pmax(0, estimate - error), ymax = estimate + error),
+    position = position_dodge(width = .6), width = .2, na.rm = TRUE
+  ) +
+  facet_wrap(~ domain, scales = "free_y") +
+  scale_y_continuous(labels = short_number) +
+  expand_limits(y = 0) +
+  labs(x = "Marker", y = "Richness estimate", colour = "Method") +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+ggsave(here(output_dir, "domain_richness_estimates.png"), domain_richness_plot,
+       width = 15, height = 7, dpi = 300)
+
+# Summary across markers: median with min-max range
+domain_summary_composition <- domain_totals %>%
+  group_by(domain) %>%
+  summarise(median = median(prop), min = min(prop), max = max(prop), .groups = "drop") %>%
+  ggplot(aes(domain, median, fill = domain)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = min, ymax = max), width = .2) +
+  scale_fill_manual(values = domain_colours) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Proportion of species") +
+  theme_cowplot() + theme(legend.position = "none")
+
+domain_summary_richness <- domain_richness_no_kemp %>%
+  group_by(domain, method) %>%
+  summarise(median = median(estimate), min = min(estimate), max = max(estimate),
+            .groups = "drop") %>%
+  ggplot(aes(method, median, colour = domain)) +
+  geom_pointrange(aes(ymin = min, ymax = max)) +
+  facet_wrap(~ domain, scales = "free_y") +
+  scale_colour_manual(values = domain_colours) +
+  scale_y_continuous(labels = short_number) +
+  expand_limits(y = 0) +
+  labs(x = NULL, y = "Richness estimate") +
+  theme_cowplot() + theme(legend.position = "none")
+
+domain_summary_figure <- plot_grid(
+  domain_summary_composition, domain_summary_richness,
+  labels = "auto", ncol = 2, rel_widths = c(1, 1.6)
+)
+ggsave(here(output_dir, "domain_summary.png"), domain_summary_figure,
+       width = 13, height = 5, dpi = 300, bg = "white")
+```
+
+```{r phylum}
+#-------------------------------------------------------------------------------
+#--- Phylum stratum: clusters assigned by singlem renew (GlobDB_r232)
+#-------------------------------------------------------------------------------
+phylum_counts <- richness_input %>%
+  filter(stratum == "phylum") %>%
+  mutate(phylum = coalesce(str_remove(stratum_value, "^p__"), "Unassigned")) %>%
+  select(marker, phylum, sample_count, species_count)
+
+phylum_totals <- phylum_counts %>%
+  group_by(marker, phylum) %>%
+  summarise(species = sum(species_count), .groups = "drop") %>%
+  complete(marker, phylum, fill = list(species = 0)) %>%
+  group_by(marker) %>%
+  mutate(prop = species / sum(species)) %>%
+  ungroup()
+write_tsv(phylum_totals, here(output_dir, "phylum_totals.tsv"))
+
+# Top phyla by median species across markers
+n_top_phyla <- 20
+top_phyla <- phylum_totals %>%
+  filter(phylum != "Unassigned") %>%
+  group_by(phylum) %>%
+  summarise(median = median(species), .groups = "drop") %>%
+  slice_max(median, n = n_top_phyla) %>%
+  pull(phylum)
+phylum_levels <- c(top_phyla, "Other", "Unassigned")
+
+phylum_grouped <- phylum_totals %>%
+  mutate(phylum = if_else(phylum %in% c(top_phyla, "Unassigned"), phylum, "Other"),
+         phylum = factor(phylum, levels = phylum_levels)) %>%
+  group_by(marker, phylum) %>%
+  summarise(species = sum(species), prop = sum(prop), .groups = "drop")
+
+phylum_heatmap <- phylum_grouped %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(marker, fct_rev(phylum), fill = prop)) +
+  geom_tile() +
+  geom_text(aes(label = scales::percent(prop, accuracy = .1)), size = 2.5) +
+  scale_fill_distiller(palette = "YlGnBu", direction = 1, labels = scales::percent) +
+  labs(x = "Marker", y = "Phylum", fill = "Proportion\nof species") +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ggsave(here(output_dir, "phylum_composition.png"), phylum_heatmap,
+       width = 12, height = 9, dpi = 300, bg = "white")
+
+# Richness per top phylum and marker
+phylum_richness <- phylum_counts %>%
+  filter(phylum %in% top_phyla) %>%
+  group_by(marker, phylum) %>%
+  group_modify(function(x, key) {
+    frequencies <- x %>%
+      transmute(frequency = sample_count, count = species_count) %>%
+      arrange(frequency)
+    fit <- tryCatch(breakaway(frequencies), error = function(e) NULL)
+    tibble(
+      method = c("Estimated total", "Observed"),
+      estimate = c(if (is.null(fit)) NA_real_ else unname(fit$estimate), sum(frequencies$count)),
+      error = c(if (is.null(fit)) NA_real_ else unname(fit$error), NA_real_),
+      model = c(if (is.null(fit)) NA_character_ else as.character(fit$model), NA_character_)
+    )
+  }) %>%
+  ungroup()
+write_tsv(phylum_richness, here(output_dir, "phylum_richness_estimates.tsv"))
+
+phylum_richness_no_kemp <- phylum_richness %>%
+  filter(!is.na(estimate), is.na(model) | model != "Kemp") %>%
+  mutate(phylum = factor(phylum, levels = rev(top_phyla)))
+
+phylum_summary_richness <- phylum_richness_no_kemp %>%
+  group_by(phylum, method) %>%
+  summarise(median = median(estimate), min = min(estimate), max = max(estimate),
+            .groups = "drop") %>%
+  ggplot(aes(median, phylum, colour = method)) +
+  geom_pointrange(aes(xmin = min, xmax = max), position = position_dodge(width = .6)) +
+  scale_x_continuous(labels = short_number) +
+  expand_limits(x = 0) +
+  labs(x = "Species (median and range across markers)", y = NULL, colour = NULL) +
+  theme_cowplot() +
+  theme(legend.position = "bottom", legend.text = element_text(margin = margin(l = 3, r = 15)),
+        plot.margin = margin(15, 5, 5, 15))
+
+# Fraction of the estimated total already observed, per marker
+phylum_completeness <- phylum_richness_no_kemp %>%
+  select(marker, phylum, method, estimate) %>%
+  pivot_wider(names_from = method, values_from = estimate) %>%
+  filter(!is.na(`Estimated total`)) %>%
+  mutate(observed_fraction = Observed / `Estimated total`) %>%
+  ggplot(aes(observed_fraction, phylum)) +
+  geom_boxplot(outlier.shape = NA, colour = "grey50") +
+  geom_point(size = .8, alpha = .6, position = position_jitter(height = .15, seed = 42)) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "Observed / estimated total", y = NULL) +
+  theme_cowplot() + theme(axis.text.y = element_blank())
+
+phylum_summary_figure <- plot_grid(
+  phylum_summary_richness, phylum_completeness,
+  labels = "auto", ncol = 2, rel_widths = c(1.6, 1), align = "h", axis = "tb"
+)
+ggsave(here(output_dir, "phylum_richness_summary.png"), phylum_summary_figure,
+       width = 13, height = 8, dpi = 300, bg = "white")
+```
+
+```{r globdb}
+#-------------------------------------------------------------------------------
+#--- GlobDB proximity: representatives within 2 bp of a GlobDB reference
+#-------------------------------------------------------------------------------
+globdb_summary <- read_tsv(here(input_dir, "globdb_summary.tsv"), show_col_types = FALSE) %>%
+  mutate(clusters_per_species = confirmed_clusters / distinct_matched_species)
+write_tsv(globdb_summary %>% select(-query_db), here(output_dir, "globdb_summary.tsv"))
+
+globdb_divergence <- map_dfr(globdb_summary$marker, function(marker_name) {
+  json <- jsonlite::read_json(here(input_dir, marker_name, "globdb_summary.json"))
+  tibble(marker = marker_name,
+         divergence = names(json$divergence_counts),
+         clusters = unlist(json$divergence_counts))
+})
+
+globdb_counts_plot <- globdb_summary %>%
+  select(marker, `Confirmed clusters` = confirmed_clusters,
+         `Distinct GlobDB species` = distinct_matched_species) %>%
+  pivot_longer(-marker, names_to = "metric", values_to = "count") %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(count, marker, fill = metric)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = muted_colours[c(2, 5)]) +
+  scale_x_continuous(labels = short_number) +
+  labs(x = "Count", y = NULL, fill = NULL) +
+  theme_cowplot() +
+  theme(legend.position = "bottom", legend.text = element_text(margin = margin(l = 3, r = 15)))
+
+globdb_ratio_plot <- globdb_summary %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(clusters_per_species, marker)) +
+  geom_vline(xintercept = median(globdb_summary$clusters_per_species),
+             linetype = "dashed", colour = "grey50") +
+  geom_point(size = 2) +
+  expand_limits(x = 1) +
+  labs(x = "Confirmed clusters per GlobDB species", y = NULL) +
+  theme_cowplot()
+
+globdb_fraction_plot <- globdb_summary %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(confirmed_fraction, marker)) +
+  geom_col(fill = muted_colours[2]) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "Clusters within 2 bp of GlobDB", y = NULL) +
+  theme_cowplot()
+
+globdb_divergence_plot <- globdb_divergence %>%
+  group_by(marker) %>%
+  mutate(prop = clusters / sum(clusters)) %>%
+  ungroup() %>%
+  mutate(marker = marker_label(marker),
+         divergence = factor(str_c(divergence, " bp"), levels = c("2 bp", "1 bp", "0 bp"))) %>%
+  ggplot(aes(prop, marker, fill = divergence)) +
+  geom_col() +
+  scale_fill_manual(values = vibrant_colours[c(5, 3, 2)], breaks = c("0 bp", "1 bp", "2 bp")) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "Confirmed clusters by divergence", y = NULL, fill = NULL) +
+  theme_cowplot() + theme(legend.position = "bottom")
+
+globdb_figure <- plot_grid(
+  globdb_counts_plot, globdb_ratio_plot, globdb_fraction_plot, globdb_divergence_plot,
+  labels = "auto", ncol = 2, align = "hv", axis = "tblr"
+)
+ggsave(here(output_dir, "globdb_summary.png"), globdb_figure,
+       width = 14, height = 10, dpi = 300, bg = "white")
+```
