@@ -142,6 +142,27 @@ class ProcessingTests(unittest.TestCase):
             ('year', '2021', 2, 1),
         ])
 
+    def test_year_strata_are_cumulative(self):
+        (self.root / 'collated_fastas').mkdir()
+        (self.root / 'collated_fastas' / (self.marker + '.fasta')).write_text(
+            '>otu0|A|gene\nAAAA\n>otu0|B|gene\nAAAA\n>otu0|C|gene\nCCCC\n>otu1|C|gene\nAAAA\n')
+        (self.marker_dir / 'clusters.tsv').write_text('AAAA\tAAAA\nCCCC\tCCCC\n')
+        metadata = self.root / 'metadata.tsv'
+        metadata.write_text('acc\tyear\torganism\nA\t2018\tsoil\nB\t2020\thuman gut metagenome\n'
+                            'C\t2022\tsoil\nD\t2019\tsoil\n')
+        m.worker_stratify_marker(str(self.root), self.marker, str(metadata))
+        counts = list(m.read_histogram(self.marker_dir / m.STRATIFIED_COUNTS_FILENAME))
+        self.assertCountEqual(counts, [
+            ('human_all', 'all', 1, 1),
+            ('human_per_year', '2020', 1, 1),
+            ('human_per_year', '2022', 1, 1),
+            ('year', '2018', 1, 1),
+            ('year', '2019', 1, 1),
+            ('year', '2020', 2, 1),
+            ('year', '2022', 3, 1),
+            ('year', '2022', 1, 1),
+        ])
+
     def test_submission_requires_ids_and_uses_background(self):
         with patch.object(m.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout='')):
             with self.assertRaises(RuntimeError):

@@ -39,7 +39,10 @@ cluster_type_levels <- c("genome_linked", "multi_sample", "multi_hit", "single_s
 ```{r wrangling}
 input_dir <- here("results", "species_estimation", "20260704")
 wrangling_path <- here(output_dir, "wrangling.RData")
-if (file.exists(wrangling_path)) {
+processed_summary_path <- here(input_dir, "species_count_complete.tsv")
+# Rebuild the cache whenever process_species_estimation.py rewrites its output
+if (file.exists(wrangling_path) &&
+    file.mtime(wrangling_path) > file.mtime(processed_summary_path)) {
   load(wrangling_path)
   print("Using prior wrangling")
 } else {
@@ -92,8 +95,8 @@ if (file.exists(wrangling_path)) {
     select(-c(tsv_path)) %>%
     unnest(data)
 
-  processed_summary_path <- here(input_dir, "species_count_complete.tsv")
-  cumulative_year <- read_tsv(processed_summary_path, show_col_types = FALSE) %>%
+  species_counts <- read_tsv(processed_summary_path, show_col_types = FALSE)
+  cumulative_year <- species_counts %>%
     filter(stratum %in% c("year", "human_per_year")) %>%
     group_by(marker, stratum, stratum_value) %>%
     summarise(species = sum(species_count), .groups = "drop") %>%
@@ -101,44 +104,20 @@ if (file.exists(wrangling_path)) {
               cohort = if_else(stratum == "year", "all", "human-gut"),
               year = as.integer(stratum_value), species)
 
-  save.image(wrangling_path)
-}
+  # Sample-count histograms (f_k = species seen in exactly k samples)
+  prevalence_histogram <- species_counts %>%
+    filter(stratum %in% c("all", "human_all"), stratum_value == "all") %>%
+    transmute(marker,
+              cohort = if_else(stratum == "all", "all", "human-gut"),
+              sample_count, species_count)
 
-#-------------------------------------------------------------------------------
-#--- Sample-by-cluster incidence data for rarefaction curves
-#-------------------------------------------------------------------------------
-# Build a sample-by-cluster incidence table for the rarefaction and cumulative
-# plots.  The processing pipeline treats each cluster as one species.
-incidence_path <- here(output_dir, "sample_cluster_incidence.RData")
-if (file.exists(incidence_path)) {
-  load(incidence_path)
-} else {
   metadata_path <- here("results", "sample_metadata", "sandpiper_39_sample_metadata_with_organism.tsv")
-  sample_metadata <- read_tsv(metadata_path, show_col_types = FALSE) %>%
-    transmute(sample = acc, year = suppressWarnings(as.integer(year)), organism)
+  cohort_samples <- read_tsv(metadata_path, show_col_types = FALSE) %>%
+    summarise(all = n(), `human-gut` = sum(organism == "human gut metagenome", na.rm = TRUE)) %>%
+    pivot_longer(everything(), names_to = "cohort", values_to = "n_samples")
 
-  read_marker_incidence <- function(marker) {
-    cluster_path <- here(input_dir, marker, "clusters.tsv")
-    fasta_path <- here(input_dir, "collated_fastas", str_c(marker, ".fasta"))
-    clusters <- read_tsv(cluster_path, col_names = c("member", "species"),
-                         show_col_types = FALSE, progress = FALSE) %>%
-      mutate(member = str_replace_all(member, "-", "N")) %>% distinct()
-    lines <- readLines(fasta_path)
-    headers <- which(str_starts(lines, ">"))
-    end <- c(headers[-1] - 1L, length(lines))
-    tibble(
-      sample = map_chr(seq_along(headers), ~ str_split(lines[headers[.x]], "\\|", simplify = TRUE)[2]),
-      sequence = map2_chr(headers, end, ~ str_replace_all(paste0(lines[(.x + 1L):.y], collapse = ""), "-", "N"))
-    ) %>%
-      left_join(clusters, by = c("sequence" = "member")) %>%
-      filter(!is.na(species)) %>% distinct(sample, species)
-  }
-
-  incidence <- map_dfr(cluster_summary$marker %>% unique(), ~
-    read_marker_incidence(.x) %>% mutate(marker = .x)) %>%
-    left_join(sample_metadata, by = "sample")
-
-  save(incidence, sample_metadata, file = incidence_path)
+  rm(species_counts)
+  save.image(wrangling_path)
 }
 ```
 
@@ -238,39 +217,25 @@ ggsave(here(output_dir, "cluster_type_treemap.png"), width = 12, height = 12, dp
 #--- Sample rarefaction and cumulative-year figures
 #-------------------------------------------------------------------------------
 # Species accumulation as a function of the fraction of samples included.
-# Ten random permutations at each fraction provide a light uncertainty band.
-rarefaction <- function(x, cohort_name, fractions = seq(.1, 1, .1), replicates = 10) {
-  samples <- x %>% filter(cohort == cohort_name) %>% distinct(sample) %>% pull(sample)
-  if (!length(samples)) return(tibble())
-  map_dfr(fractions, function(fraction) {
-    n <- max(1L, ceiling(length(samples) * fraction))
-    map_dfr(seq_len(replicates), function(rep) {
-      selected <- sample(samples, n)
-      tibble(fraction = fraction, replicate = rep,
-             species = n_distinct(x$species[x$sample %in% selected]))
-    })
-  }) %>% mutate(cohort = cohort_name)
-}
-
-incidence_cohorts <- incidence %>%
-  mutate(cohort = if_else(organism == "human gut metagenome", "human-gut", "all"))
-rarefaction_data <- map_dfr(sort(unique(incidence_cohorts$marker)), function(marker_name) {
-  x <- filter(incidence_cohorts, marker == marker_name)
-  bind_rows(rarefaction(x, "all"), rarefaction(x, "human-gut")) %>%
-    mutate(marker = marker_name)
-})
+# Expected species in a random subset of n of N samples, computed exactly from
+# the sample-count histogram (incidence-based rarefaction, Colwell et al. 2012):
+#   S(n) = sum_k f_k * (1 - choose(N - k, n) / choose(N, n))
+# N is every sample in the cohort, including samples without hits for a marker.
+rarefaction_data <- prevalence_histogram %>%
+  inner_join(cohort_samples, by = "cohort") %>%
+  cross_join(tibble(fraction = seq(.1, 1, .1))) %>%
+  mutate(n = ceiling(n_samples * fraction),
+         detected = 1 - exp(lchoose(n_samples - sample_count, n) - lchoose(n_samples, n))) %>%
+  group_by(marker, cohort, fraction) %>%
+  summarise(species = sum(species_count * detected), .groups = "drop")
 
 rarefaction_plot <- rarefaction_data %>%
-  group_by(marker, cohort, fraction) %>%
-  summarise(mean_species = mean(species),
-            lower = quantile(species, .025), upper = quantile(species, .975), .groups = "drop") %>%
-  ggplot(aes(fraction, mean_species, colour = cohort, fill = cohort)) +
-  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = .18, colour = NA) +
+  ggplot(aes(fraction, species, colour = cohort)) +
   geom_line(linewidth = .7) +
   facet_wrap(~ marker, scales = "free_y") +
   scale_x_continuous(labels = scales::percent, breaks = seq(.1, 1, .1)) +
   scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
-  labs(x = "Fraction of samples", y = "Species observed", colour = NULL, fill = NULL) +
+  labs(x = "Fraction of samples", y = "Expected species observed", colour = NULL) +
   theme_cowplot() + theme(legend.position = "bottom")
 ggsave(here(output_dir, "sample_rarefaction.png"), rarefaction_plot,
        width = 14, height = 9, dpi = 300)

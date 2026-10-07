@@ -2,6 +2,7 @@ test/
 results/
 data/
 *chunking/
+scripts/species_estimation_files/
 
 .vscode/
 .Rhistory

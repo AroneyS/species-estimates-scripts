@@ -380,13 +380,15 @@ def load_sample_metadata(tsv_path):
 #        organism) tuples (year and human classification looked up from metadata
 #        metadata dict -- ~913k rows, trivial), then sort by sequence.
 #     3. join (1) and (2) on sequence -> (rep_seq, sample, year, organism) rows,
-#        emitting two tagged tuples per row: (rep, "year", <year>, sample)
-#        and (rep, "host", <host>, sample).
+#        emitting tagged tuples per row: (rep, "year", <own year>, sample),
+#        plus (rep, "human_per_year", <own year>, sample) and
+#        (rep, "human_all", "all", sample) for human gut samples.
 #     4. sort -u the tagged-tuple stream (dedupes a sample contributing
 #        multiple divergent-but-clustered sequences, matching the "union not
 #        sum" semantics of the existing n_samples field).
 #     5. stream-count: consecutive (rep, stratum, value) runs -> distinct
-#        sample count -> tally into a species-count histogram.
+#        sample count -> tally into a species-count histogram, summing
+#        per-year counts into cumulative year cutoffs.
 # ---------------------------------------------------------------------------
 
 def _parse_sample_from_header(header):
@@ -456,15 +458,17 @@ def _write_otu_tuples(collated_fasta_path, sample_metadata, out_path):
     return n_written
 
 
-def _join_and_tag(clusters_sorted_path, otu_sorted_path, tagged_path, years,
+def _join_and_tag(clusters_sorted_path, otu_sorted_path, tagged_path,
                   human_organism="human gut metagenome"):
     """
     join clusters_sorted_path (member_seq \t rep_seq) with otu_sorted_path
-    (seq \t sample \t year \t organism) on sequence, then write cumulative year
-    and human-gut tagged rows
-    per match to tagged_path:
+    (seq \t sample \t year \t organism) on sequence, then write year and
+    human-gut tagged rows per match to tagged_path:
         rep_seq \t year \t <year> \t sample
         rep_seq \t human_all|human_per_year \t <value> \t sample
+    Year rows carry the sample's own collection year only; _tally_histogram
+    expands them to cumulative cutoffs. Expanding here would multiply the
+    tagged file (and the following sort -u) by the number of later years.
     """
     env = dict(os.environ, LC_ALL="C")
     join_cmd = [
@@ -480,17 +484,10 @@ def _join_and_tag(clusters_sorted_path, otu_sorted_path, tagged_path, years,
             if len(parts) < 5:
                 continue
             _seq, rep_seq, sample, year, organism = parts[0], parts[1], parts[2], parts[3], parts[4]
-            if year != NA:
-                try:
-                    year_num = int(year)
-                except ValueError:
-                    year_num = None
-                if year_num is not None:
-                    for cutoff in years:
-                        if year_num <= cutoff:
-                            out_fh.write(f"{rep_seq}\tyear\t{cutoff}\t{sample}\n")
-                            if organism == human_organism:
-                                out_fh.write(f"{rep_seq}\thuman_per_year\t{cutoff}\t{sample}\n")
+            if year != NA and year.isdigit():
+                out_fh.write(f"{rep_seq}\tyear\t{int(year)}\t{sample}\n")
+                if organism == human_organism:
+                    out_fh.write(f"{rep_seq}\thuman_per_year\t{int(year)}\t{sample}\n")
             if organism == human_organism:
                 out_fh.write(f"{rep_seq}\thuman_all\tall\t{sample}\n")
             n_rows += 1
@@ -516,19 +513,43 @@ def _dedup_sort(tagged_path, dedup_path, tmp_dir=None, threads=1):
     subprocess.run(cmd, check=True, env=env)
 
 
-def _tally_histogram(dedup_sorted_path):
+CUMULATIVE_STRATA = ("year", "human_per_year")
+
+
+def _tally_histogram(dedup_sorted_path, years):
     """
     Stream the sorted-unique (rep, stratum, value, sample) file and, for each
     consecutive (rep, stratum, value) run, count distinct samples, then tally
     into counts[(stratum, value, sample_count)] += 1.
+
+    CUMULATIVE_STRATA rows hold each sample's own year. Each sample has one
+    year, so a cluster's distinct-sample count through cutoff Y is the sum of
+    its per-year counts for years <= Y; that is tallied for every cutoff in
+    years at which the cluster has been seen.
     """
     counts = Counter()
     cur_key = None
     cur_count = 0
+    per_year = {}  # year -> distinct samples, for the current (rep, stratum)
+
+    def _flush_cumulative():
+        if not per_year:
+            return
+        stratum = cur_key[1]
+        running = 0
+        for cutoff in years:
+            running += per_year.get(cutoff, 0)
+            if running > 0:
+                counts[(stratum, str(cutoff), running)] += 1
+        per_year.clear()
 
     def _flush():
-        if cur_key is not None and cur_count > 0:
-            stratum, value = cur_key[1], cur_key[2]
+        if cur_key is None or cur_count == 0:
+            return
+        stratum, value = cur_key[1], cur_key[2]
+        if stratum in CUMULATIVE_STRATA:
+            per_year[int(value)] = cur_count
+        else:
             counts[(stratum, value, cur_count)] += 1
 
     with open(dedup_sorted_path) as fh:
@@ -542,9 +563,12 @@ def _tally_histogram(dedup_sorted_path):
                 cur_count += 1
             else:
                 _flush()
+                if cur_key is not None and cur_key[:2] != key[:2]:
+                    _flush_cumulative()
                 cur_key = key
                 cur_count = 1
         _flush()
+        _flush_cumulative()
 
     return counts
 
@@ -590,7 +614,7 @@ def worker_stratify_marker(output_dir, marker_name, sample_metadata_path, tmp_di
                         if year != NA and year.isdigit()})
         if not years:
             raise ValueError("No numeric collection years found in sample metadata")
-        n_joined = _join_and_tag(clusters_sorted, otu_sorted, tagged, years, human_organism)
+        n_joined = _join_and_tag(clusters_sorted, otu_sorted, tagged, human_organism)
         if n_joined < n_otus:
             logging.warning(
                 f"[{marker_name}] {n_otus - n_joined}/{n_otus} OTU sequence(s) had no "
@@ -602,7 +626,7 @@ def worker_stratify_marker(output_dir, marker_name, sample_metadata_path, tmp_di
         _dedup_sort(tagged, dedup_sorted, tmp_dir=tmp_dir, threads=threads)
 
         logging.info(f"[{marker_name}] Tallying stratified sample-count histogram ...")
-        counts = _tally_histogram(dedup_sorted)
+        counts = _tally_histogram(dedup_sorted, years)
     finally:
         for f in (clusters_sorted, otu_tuples, otu_sorted, tagged, dedup_sorted):
             if os.path.exists(f):
