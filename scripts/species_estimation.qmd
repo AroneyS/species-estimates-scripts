@@ -18,7 +18,7 @@ library(cowplot)
 library(tidyverse)
 library(here)
 
-output_dir <- here("results", "species_estimation_qmd", "20260909")
+output_dir <- here("results", "species_estimation_qmd", "20261007")
 dir.create(output_dir, recursive = TRUE)
 
 set.seed(42)
@@ -34,16 +34,35 @@ muted_colours <- c("#882255", "#332288", "#DDCC77", "#117733", "#88CCEE", "#CC66
 bright_colours <- c("#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377", "#BBBBBB")
 
 cluster_type_levels <- c("genome_linked", "multi_sample", "multi_hit", "single_singleton")
+
+# Short marker names for plots, ordered by marker number
+# e.g. S3.1.ribosomal_protein_L2_rplB -> RP_L2_rplB
+marker_label <- function(marker) {
+  marker_n <- as.integer(str_extract(marker, "(?<=^S3\\.)\\d+"))
+  marker %>%
+    str_remove("^S3\\.\\d+\\.") %>%
+    str_replace("ribosomal_protein", "RP") %>%
+    str_replace("ribosomal", "R") %>%
+    fct_reorder(marker_n)
+}
 ```
 
 ```{r wrangling}
 input_dir <- here("results", "species_estimation", "20260704")
 wrangling_path <- here(output_dir, "wrangling.RData")
 processed_summary_path <- here(input_dir, "species_count_complete.tsv")
+metadata_path <- here("results", "sample_metadata", "sandpiper_39_sample_metadata_with_organism.tsv")
+wrangling_objects <- c("summary", "cluster_summary", "cumulative_year",
+                       "prevalence_histogram", "cohort_samples")
+
 # Rebuild the cache whenever process_species_estimation.py rewrites its output
 if (file.exists(wrangling_path) &&
     file.mtime(wrangling_path) > file.mtime(processed_summary_path)) {
-  load(wrangling_path)
+  # Restore only the data, not settings such as output_dir
+  wrangling_cache <- new.env()
+  load(wrangling_path, envir = wrangling_cache)
+  list2env(mget(wrangling_objects, envir = wrangling_cache), envir = environment())
+  rm(wrangling_cache)
   print("Using prior wrangling")
 } else {
   summary <- read_tsv(here(input_dir, "summary.tsv"))
@@ -111,13 +130,12 @@ if (file.exists(wrangling_path) &&
               cohort = if_else(stratum == "all", "all", "human-gut"),
               sample_count, species_count)
 
-  metadata_path <- here("results", "sample_metadata", "sandpiper_39_sample_metadata_with_organism.tsv")
   cohort_samples <- read_tsv(metadata_path, show_col_types = FALSE) %>%
     summarise(all = n(), `human-gut` = sum(organism == "human gut metagenome", na.rm = TRUE)) %>%
     pivot_longer(everything(), names_to = "cohort", values_to = "n_samples")
 
   rm(species_counts)
-  save.image(wrangling_path)
+  save(list = wrangling_objects, file = wrangling_path)
 }
 ```
 
@@ -176,11 +194,10 @@ cluster_summary %>%
   select(marker, cluster_type, n, prop) %>%
   pivot_longer(cols = c(n, prop), names_to = "metric", values_to = "value") %>%
   mutate(
-    marker = factor(marker),
-    marker_n = str_extract(marker, "(?<=S3.)\\d+") %>% as.integer(),
+    marker = marker_label(marker),
     cluster_type = factor(cluster_type, levels = cluster_type_levels)
     ) %>%
-  ggplot(aes(x = fct_reorder(marker, marker_n), y = value, fill = cluster_type)) +
+  ggplot(aes(x = marker, y = value, fill = cluster_type)) +
   geom_bar(stat = "identity") +
   facet_wrap(~ metric, scales = "free_x") +
   scale_fill_manual(values = muted_colours, drop = FALSE) +
@@ -193,7 +210,7 @@ cluster_summary %>%
 ggsave(here(output_dir, "cluster_type_barplot.png"), width = 12, height = 6, dpi = 600)
 
 # Treemap of cluster types as a median proportion across markers
-cluster_summary %>%
+cluster_type_treemap <- cluster_summary %>%
   group_by(marker) %>%
   mutate(
     prop = n / sum(n),
@@ -211,7 +228,8 @@ cluster_summary %>%
   scale_fill_manual(values = muted_colours, drop = FALSE) +
   theme_cowplot() +
   theme(legend.position = "none")
-ggsave(here(output_dir, "cluster_type_treemap.png"), width = 12, height = 12, dpi = 600)
+ggsave(here(output_dir, "cluster_type_treemap.png"), cluster_type_treemap,
+       width = 12, height = 12, dpi = 600)
 
 #-------------------------------------------------------------------------------
 #--- Sample rarefaction and cumulative-year figures
@@ -229,26 +247,77 @@ rarefaction_data <- prevalence_histogram %>%
   group_by(marker, cohort, fraction) %>%
   summarise(species = sum(species_count * detected), .groups = "drop")
 
+# One row per cohort: y-axis shared across markers, free between cohorts
+marker_facet_theme <- theme(
+  legend.position = "none",
+  strip.text.x = element_text(size = 9),
+  axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1)
+)
+
 rarefaction_plot <- rarefaction_data %>%
+  mutate(marker = marker_label(marker)) %>%
   ggplot(aes(fraction, species, colour = cohort)) +
   geom_line(linewidth = .7) +
-  facet_wrap(~ marker, scales = "free_y") +
-  scale_x_continuous(labels = scales::percent, breaks = seq(.1, 1, .1)) +
+  facet_grid(cohort ~ marker, scales = "free_y") +
+  expand_limits(y = 0) +
+  scale_x_continuous(labels = scales::percent, breaks = seq(.2, 1, .2)) +
   scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
-  labs(x = "Fraction of samples", y = "Expected species observed", colour = NULL) +
-  theme_cowplot() + theme(legend.position = "bottom")
+  labs(x = "Fraction of samples", y = "Expected species observed") +
+  theme_cowplot() + marker_facet_theme
 ggsave(here(output_dir, "sample_rarefaction.png"), rarefaction_plot,
-       width = 14, height = 9, dpi = 300)
+       width = 20, height = 7, dpi = 300)
 
 cumulative_year_plot <- cumulative_year %>%
+  mutate(marker = marker_label(marker)) %>%
   ggplot(aes(year, species, colour = cohort)) +
-  geom_line(linewidth = .7) + geom_point(size = 1) +
-  facet_wrap(~ marker, scales = "free_y") +
+  geom_line(linewidth = .7) + geom_point(size = .6) +
+  facet_grid(cohort ~ marker, scales = "free_y") +
+  scale_x_continuous(breaks = seq(1990, 2020, 10)) +
   scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
-  labs(x = "Collection year (cumulative through year)", y = "Species observed", colour = NULL) +
-  theme_cowplot() + theme(legend.position = "bottom")
+  labs(x = "Collection year (cumulative through year)", y = "Species observed") +
+  theme_cowplot() + marker_facet_theme
 ggsave(here(output_dir, "cumulative_year_species.png"), cumulative_year_plot,
-       width = 14, height = 9, dpi = 300)
+       width = 20, height = 7, dpi = 300)
+
+# Species against cumulative samples, adding samples in collection-year order.
+# Unlike the year axis, this is not flattened by the few recent samples.
+# Samples without a collection year are excluded, as in cumulative_year.
+dated_samples <- read_tsv(metadata_path, show_col_types = FALSE) %>%
+  transmute(year = suppressWarnings(as.integer(year)),
+            human = organism %in% "human gut metagenome") %>%
+  filter(!is.na(year))
+cumulative_samples <- bind_rows(
+    dated_samples %>% count(year, name = "samples") %>% mutate(cohort = "all"),
+    dated_samples %>% filter(human) %>% count(year, name = "samples") %>% mutate(cohort = "human-gut")
+  ) %>%
+  right_join(distinct(cumulative_year, cohort, year), by = c("cohort", "year")) %>%
+  replace_na(list(samples = 0)) %>%
+  arrange(cohort, year) %>%
+  group_by(cohort) %>%
+  mutate(cumulative_samples = cumsum(samples)) %>%
+  ungroup()
+cumulative_sample_data <- cumulative_year %>%
+  inner_join(cumulative_samples, by = c("cohort", "year"))
+
+# Cohorts have very different sample totals, so each gets its own row with
+# x and y axes shared across markers
+cumulative_samples_plot <- map(c("all", "human-gut"), function(cohort_name) {
+  cumulative_sample_data %>%
+    filter(cohort == cohort_name) %>%
+    mutate(marker = marker_label(marker)) %>%
+    ggplot(aes(cumulative_samples, species)) +
+    geom_line(linewidth = .7, colour = vibrant_colours[if (cohort_name == "all") 1 else 2]) +
+    geom_point(size = .6, colour = vibrant_colours[if (cohort_name == "all") 1 else 2]) +
+    facet_wrap(~ marker, nrow = 1) +
+    scale_x_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(title = cohort_name, x = "Cumulative samples (in collection-year order)",
+         y = "Species observed") +
+    theme_cowplot() + marker_facet_theme
+}) %>%
+  plot_grid(plotlist = ., ncol = 1)
+ggsave(here(output_dir, "cumulative_samples_species.png"), cumulative_samples_plot,
+       width = 20, height = 9, dpi = 300, bg = "white")
 ```
 
 ```{r richness}
@@ -310,21 +379,23 @@ richness_results <- map_dfr(c("all", "human-gut"), function(cohort_name) {
 write_tsv(richness_results, here(output_dir, "richness_estimates.tsv"))
 
 richness_plot_data <- richness_results %>%
-  select(marker, cohort, breakaway_estimate, breakaway_error,
-         observed_estimate, nof1_estimate, nof1_error) %>%
+  select(marker, cohort, breakaway_estimate, breakaway_error, breakaway_model,
+         observed_estimate, nof1_estimate, nof1_error, nof1_model) %>%
   pivot_longer(
     cols = -c(marker, cohort),
     names_to = c("method", ".value"),
-    names_pattern = "(.*)_(estimate|error)"
+    names_pattern = "(.*)_(estimate|error|model)"
   ) %>%
   mutate(method = recode(
     method,
     breakaway = "Estimated total",
     observed = "Observed",
     nof1 = "Estimated total (singletons excluded)"
-  ))
+  ),
+  marker = marker_label(marker))
 
-richness_plot <- richness_plot_data %>%
+plot_richness <- function(plot_data) {
+  plot_data %>%
   ggplot(aes(x = marker, y = estimate, colour = method)) +
   geom_point(position = position_dodge(width = .6), size = 1.8) +
   geom_errorbar(
@@ -337,6 +408,76 @@ richness_plot <- richness_plot_data %>%
   labs(x = "Marker", y = "Richness estimate", colour = "Method") +
   theme_cowplot() +
   theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
-ggsave(here(output_dir, "richness_estimates.png"), richness_plot,
+}
+ggsave(here(output_dir, "richness_estimates.png"), plot_richness(richness_plot_data),
        width = 15, height = 9, dpi = 300)
+
+# Without fits that fell back to a Kemp model (unstable, very large errors)
+richness_no_kemp <- richness_plot_data %>% filter(is.na(model) | model != "Kemp")
+ggsave(here(output_dir, "richness_estimates_no_kemp.png"), plot_richness(richness_no_kemp),
+       width = 15, height = 9, dpi = 300)
+```
+
+```{r summary_figure}
+#-------------------------------------------------------------------------------
+#--- Summary figure: each panel summarises across all markers
+#-------------------------------------------------------------------------------
+# Lines/points are the median across markers; ribbons/bars span min to max.
+cohort_colours <- c(all = vibrant_colours[1], `human-gut` = vibrant_colours[2])
+short_number <- scales::label_number(scale_cut = scales::cut_short_scale())
+
+summarise_markers <- function(x, ...) {
+  x %>%
+    group_by(...) %>%
+    summarise(median = median(species), min = min(species), max = max(species),
+              .groups = "drop")
+}
+
+summary_richness <- richness_no_kemp %>%
+  group_by(cohort, method) %>%
+  summarise(median = median(estimate), min = min(estimate), max = max(estimate),
+            .groups = "drop") %>%
+  ggplot(aes(method, median, colour = cohort)) +
+  geom_pointrange(aes(ymin = min, ymax = max)) +
+  facet_wrap(~ cohort, scales = "free_y") +
+  scale_colour_manual(values = cohort_colours) +
+  scale_x_discrete(labels = scales::label_wrap(15)) +
+  scale_y_continuous(labels = short_number) +
+  expand_limits(y = 0) +
+  labs(x = NULL, y = "Richness estimate") +
+  theme_cowplot() + theme(legend.position = "none")
+
+summary_cumulative_year <- cumulative_year %>%
+  summarise_markers(cohort, year) %>%
+  ggplot(aes(year, median, colour = cohort, fill = cohort)) +
+  geom_ribbon(aes(ymin = min, ymax = max), alpha = .25, colour = NA) +
+  geom_line(linewidth = .7) +
+  facet_wrap(~ cohort, scales = "free_y") +
+  scale_colour_manual(values = cohort_colours) +
+  scale_fill_manual(values = cohort_colours) +
+  scale_y_continuous(labels = short_number) +
+  labs(x = "Collection year (cumulative through year)", y = "Species observed") +
+  theme_cowplot() + theme(legend.position = "none")
+
+summary_rarefaction <- rarefaction_data %>%
+  summarise_markers(cohort, fraction) %>%
+  ggplot(aes(fraction, median, colour = cohort, fill = cohort)) +
+  geom_ribbon(aes(ymin = min, ymax = max), alpha = .25, colour = NA) +
+  geom_line(linewidth = .7) +
+  facet_wrap(~ cohort, scales = "free_y") +
+  scale_colour_manual(values = cohort_colours) +
+  scale_fill_manual(values = cohort_colours) +
+  scale_x_continuous(labels = scales::percent, breaks = seq(.2, 1, .2)) +
+  scale_y_continuous(labels = short_number) +
+  expand_limits(y = 0) +
+  labs(x = "Fraction of samples", y = "Expected species observed") +
+  theme_cowplot() + theme(legend.position = "none")
+
+summary_figure <- plot_grid(
+  cluster_type_treemap, summary_richness,
+  summary_cumulative_year, summary_rarefaction,
+  labels = "auto", ncol = 2
+)
+ggsave(here(output_dir, "summary_figure.png"), summary_figure,
+       width = 16, height = 12, dpi = 300, bg = "white")
 ```
