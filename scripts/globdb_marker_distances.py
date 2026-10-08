@@ -11,9 +11,8 @@
 #        genomes in the same species (up to MAX_INTRA_SEQS per species).
 #      - intra_diameter: per species, the largest such distance (0 when all
 #        of a species' genomes share one sequence, or it has one genome).
-#      - inter_nearest: for a random sample of species, the distance from one
-#        of its sequences to the nearest sequence of any other species
-#        (0 when the sequence is shared with another species).
+#      - inter_sampled_all: distances from one randomly selected window in
+#        sampled species to one representative window from every species.
 #
 #    Output is a long TSV: marker, metric, distance, count. Distances are
 #    capped at MAX_DISTANCE ("MAX_DISTANCE or more").
@@ -38,7 +37,7 @@ DEFAULT_DB = ("/mnt/hpccs01/work/microbiome/db/singlem/GlobDB_r232.metapackage_v
 DEFAULT_OUTPUT = "results/globdb_marker_distances/GlobDB_r232.tsv"
 MAX_DISTANCE = 15
 MAX_INTRA_SEQS = 30
-QUERY_BATCH = 8
+QUERY_BATCH = 64
 
 
 def species_of(taxonomy):
@@ -84,28 +83,26 @@ def marker_distances(conn, marker_id, n_inter_species, rng):
             counts[("intra_pair", int(x))] += 1
         counts[("intra_diameter", int(min(upper.max(), MAX_DISTANCE)))] += 1
 
-    # Nearest other species. owner[i] is the species index of sequence i, or
-    # -1 when the sequence is shared by several species.
-    seq_owner = {}
-    for i, sp in enumerate(species):
-        for s in species_seqs[sp]:
-            seq_owner[s] = i if seq_owner.get(s, i) == i else -1
-    all_seqs = list(seq_owner)
-    owner = np.array([seq_owner[s] for s in all_seqs])
-    all_arr = encode(all_seqs)
-    seq_index = {s: i for i, s in enumerate(all_seqs)}
-
-    query_species = rng.sample(range(len(species)), min(n_inter_species, len(species)))
-    for start in range(0, len(query_species), QUERY_BATCH):
-        batch = query_species[start:start + QUERY_BATCH]
-        query_seqs = [rng.choice(sorted(species_seqs[species[i]])) for i in batch]
-        d = (encode(query_seqs)[:, None, :] != all_arr[None, :, :]).sum(-1)
-        for row, sp_i, q in zip(d, batch, query_seqs):
-            if owner[seq_index[q]] == -1:
-                nearest = 0
-            else:
-                nearest = row[owner != sp_i].min()
-            counts[("inter_nearest", int(min(nearest, MAX_DISTANCE)))] += 1
+    # Compare sampled species against all species. Row batches bound the
+    # temporary distance matrix, while the target array contains one
+    # representative window per species.
+    sampled_species = rng.sample(range(len(species)), min(n_inter_species, len(species)))
+    sampled_seqs = [rng.choice(sorted(species_seqs[species[i]])) for i in sampled_species]
+    target_seqs = [rng.choice(sorted(species_seqs[sp])) for sp in species]
+    sampled_arr = encode(sampled_seqs)
+    target_arr = encode(target_seqs)
+    for start in range(0, len(sampled_seqs), QUERY_BATCH):
+        stop = min(start + QUERY_BATCH, len(sampled_seqs))
+        d = (sampled_arr[start:stop, None, :] != target_arr[None, :, :]).sum(-1)
+        for row, query_i in zip(d, range(start, stop)):
+            query_species_index = sampled_species[query_i]
+            nearest = None
+            for target_i, distance in enumerate(row):
+                if target_i == query_species_index:
+                    continue
+                counts[("inter_sampled_all", int(min(distance, MAX_DISTANCE)))] += 1
+                nearest = distance if nearest is None else min(nearest, distance)
+            counts[("inter_sampled_nearest", int(min(nearest, MAX_DISTANCE)))] += 1
     return counts
 
 
@@ -117,7 +114,7 @@ def main():
     parser.add_argument("--max-marker-number", type=int, default=13,
                         help="Highest S3.N marker to include (default: 13, the markers analysed)")
     parser.add_argument("--inter-species", type=int, default=3000,
-                        help="Species sampled per marker for nearest other-species distance")
+                        help="Species sampled per marker for sampled-to-all distance histogram")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")

@@ -904,58 +904,74 @@ ggsave(here(output_dir, "frequency_ratios.png"), frequency_ratio_plot,
 #-------------------------------------------------------------------------------
 #--- Marker-window distances between GlobDB species
 #-------------------------------------------------------------------------------
-# From scripts/globdb_marker_distances.py: for a random sample of species, the
-# distance from its marker window to the nearest window of any other species
-# (capped at 15). GlobDB holds about one genome per species, so it cannot show
-# within-species variation; only the between-species side is plotted.
+# From scripts/globdb_marker_distances.py: distances from one randomly selected
+# marker window in each sampled species to one representative window from every
+# GlobDB species (capped at 15).
 marker_distances <- read_tsv(
-    here("results", "globdb_marker_distances", "GlobDB_r232.tsv"), show_col_types = FALSE
+    here("results", "globdb_marker_distances", "GlobDB_r232_100.tsv"), show_col_types = FALSE
   ) %>%
   filter(marker %in% unique(cluster_summary$marker))
 max_distance <- max(marker_distances$distance)
 clustering_cutoff <- 2
 
-nearest_species <- marker_distances %>%
-  filter(metric == "inter_nearest") %>%
-  complete(marker, distance = 0:max_distance, fill = list(count = 0, metric = "inter_nearest")) %>%
+all_pair_distances <- marker_distances %>%
+  filter(metric == "inter_sampled_all") %>%
+  complete(marker, distance = 0:max_distance, fill = list(count = 0, metric = "inter_sampled_all")) %>%
   group_by(marker) %>%
-  arrange(distance, .by_group = TRUE) %>%
-  mutate(prop = count / sum(count), cumulative = cumsum(prop)) %>%
+  mutate(prop = count / sum(count)) %>%
   ungroup()
-write_tsv(nearest_species, here(output_dir, "globdb_nearest_species.tsv"))
+write_tsv(all_pair_distances, here(output_dir, "globdb_all_pair_distances.tsv"))
 
-# a) Species with another species within each distance, per marker
-nearest_cumulative_plot <- nearest_species %>%
-  filter(distance < max_distance) %>%
-  mutate(marker = marker_label(marker)) %>%
-  ggplot(aes(distance, cumulative, group = marker)) +
-  geom_vline(xintercept = clustering_cutoff, linetype = "dashed", colour = "grey50") +
-  geom_line(colour = "grey60", linewidth = .4) +
-  stat_summary(aes(group = NULL), fun = median, geom = "line",
-               colour = vibrant_colours[1], linewidth = 1) +
-  scale_x_continuous(breaks = 0:(max_distance - 1)) +
-  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
-  labs(x = "Distance to nearest other species (bp)",
-       y = "GlobDB species with another\nspecies within this distance") +
+# Proportion of sampled-to-all species comparisons at each distance. Distances
+# above 5 bp are combined to keep the histogram readable.
+all_pair_histogram_data <- all_pair_distances %>%
+  mutate(distance_bin = if_else(distance <= 5, as.character(distance), ">5")) %>%
+  group_by(marker, distance_bin) %>%
+  summarise(prop = sum(prop), .groups = "drop") %>%
+  mutate(distance_bin = factor(distance_bin, levels = c(as.character(0:5), ">5")),
+         marker = marker_label(marker))
+
+all_pair_histogram <- all_pair_histogram_data %>%
+  filter(distance_bin != ">5") %>%
+  ggplot(aes(distance_bin, prop)) +
+  geom_vline(xintercept = clustering_cutoff + 1, linetype = "dashed", colour = "grey50") +
+  geom_col(fill = vibrant_colours[1], width = .9) +
+  facet_wrap(~ marker, ncol = 3) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Hamming distance between sampled species windows (bp)",
+       y = "Proportion of sampled-to-all comparisons") +
   theme_cowplot()
 
-# b) Species merged with another at the 2 bp cutoff, by distance, per marker
+nearest_species <- marker_distances %>%
+  filter(metric == "inter_sampled_nearest") %>%
+  complete(marker, distance = 0:max_distance,
+           fill = list(count = 0, metric = "inter_sampled_nearest")) %>%
+  group_by(marker) %>%
+  mutate(prop = count / sum(count)) %>%
+  ungroup()
+
+# Fraction of sampled species whose nearest other species is at each distance
+# up to the 2-bp cutoff.
 nearest_cutoff_plot <- nearest_species %>%
   filter(distance <= clustering_cutoff) %>%
   mutate(marker = marker_label(marker),
-         distance = factor(str_c(distance, " bp"), levels = c("2 bp", "1 bp", "0 bp"))) %>%
+         distance = factor(str_c(distance, " bp"),
+                           levels = c("2 bp", "1 bp", "0 bp"))) %>%
   ggplot(aes(prop, marker, fill = distance)) +
   geom_col() +
-  scale_fill_manual(values = vibrant_colours[c(5, 3, 2)], breaks = c("0 bp", "1 bp", "2 bp")) +
+  scale_fill_manual(values = vibrant_colours[c(5, 3, 2)],
+                    breaks = c("0 bp", "1 bp", "2 bp")) +
   scale_x_continuous(labels = scales::percent) +
-  labs(x = "GlobDB species with another species within 2 bp", y = NULL,
+  labs(x = "Sampled GlobDB species with another species within 2 bp", y = NULL,
        fill = "Nearest other species") +
   guides(fill = guide_legend(title.position = "top")) +
   theme_cowplot() +
-  theme(legend.position = "bottom", legend.text = element_text(margin = margin(l = 3, r = 15)))
+  theme(legend.position = "bottom",
+        legend.text = element_text(margin = margin(l = 3, r = 15)))
 
-globdb_distance_figure <- plot_grid(nearest_cumulative_plot, nearest_cutoff_plot,
-                                    labels = "auto", ncol = 2, rel_widths = c(1, 1.1))
+globdb_distance_figure <- plot_grid(all_pair_histogram, nearest_cutoff_plot,
+                                    labels = "auto", ncol = 2,
+                                    rel_widths = c(1.2, 1))
 ggsave(here(output_dir, "globdb_marker_distances.png"), globdb_distance_figure,
-       width = 14, height = 6, dpi = 300, bg = "white")
+       width = 18, height = 10, dpi = 300, bg = "white")
 ```
