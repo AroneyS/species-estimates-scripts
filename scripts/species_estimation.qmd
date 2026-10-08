@@ -899,3 +899,63 @@ frequency_ratio_plot <- frequency_ratios %>%
 ggsave(here(output_dir, "frequency_ratios.png"), frequency_ratio_plot,
        width = 10, height = 10, dpi = 300, bg = "white")
 ```
+
+```{r globdb_marker_distances}
+#-------------------------------------------------------------------------------
+#--- Marker-window distances between GlobDB species
+#-------------------------------------------------------------------------------
+# From scripts/globdb_marker_distances.py: for a random sample of species, the
+# distance from its marker window to the nearest window of any other species
+# (capped at 15). GlobDB holds about one genome per species, so it cannot show
+# within-species variation; only the between-species side is plotted.
+marker_distances <- read_tsv(
+    here("results", "globdb_marker_distances", "GlobDB_r232.tsv"), show_col_types = FALSE
+  ) %>%
+  filter(marker %in% unique(cluster_summary$marker))
+max_distance <- max(marker_distances$distance)
+clustering_cutoff <- 2
+
+nearest_species <- marker_distances %>%
+  filter(metric == "inter_nearest") %>%
+  complete(marker, distance = 0:max_distance, fill = list(count = 0, metric = "inter_nearest")) %>%
+  group_by(marker) %>%
+  arrange(distance, .by_group = TRUE) %>%
+  mutate(prop = count / sum(count), cumulative = cumsum(prop)) %>%
+  ungroup()
+write_tsv(nearest_species, here(output_dir, "globdb_nearest_species.tsv"))
+
+# a) Species with another species within each distance, per marker
+nearest_cumulative_plot <- nearest_species %>%
+  filter(distance < max_distance) %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(distance, cumulative, group = marker)) +
+  geom_vline(xintercept = clustering_cutoff, linetype = "dashed", colour = "grey50") +
+  geom_line(colour = "grey60", linewidth = .4) +
+  stat_summary(aes(group = NULL), fun = median, geom = "line",
+               colour = vibrant_colours[1], linewidth = 1) +
+  scale_x_continuous(breaks = 0:(max_distance - 1)) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Distance to nearest other species (bp)",
+       y = "GlobDB species with another\nspecies within this distance") +
+  theme_cowplot()
+
+# b) Species merged with another at the 2 bp cutoff, by distance, per marker
+nearest_cutoff_plot <- nearest_species %>%
+  filter(distance <= clustering_cutoff) %>%
+  mutate(marker = marker_label(marker),
+         distance = factor(str_c(distance, " bp"), levels = c("2 bp", "1 bp", "0 bp"))) %>%
+  ggplot(aes(prop, marker, fill = distance)) +
+  geom_col() +
+  scale_fill_manual(values = vibrant_colours[c(5, 3, 2)], breaks = c("0 bp", "1 bp", "2 bp")) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "GlobDB species with another species within 2 bp", y = NULL,
+       fill = "Nearest other species") +
+  guides(fill = guide_legend(title.position = "top")) +
+  theme_cowplot() +
+  theme(legend.position = "bottom", legend.text = element_text(margin = margin(l = 3, r = 15)))
+
+globdb_distance_figure <- plot_grid(nearest_cumulative_plot, nearest_cutoff_plot,
+                                    labels = "auto", ncol = 2, rel_widths = c(1, 1.1))
+ggsave(here(output_dir, "globdb_marker_distances.png"), globdb_distance_figure,
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
