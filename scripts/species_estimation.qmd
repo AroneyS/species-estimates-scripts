@@ -327,6 +327,85 @@ ggsave(here(output_dir, "cumulative_samples_species.png"), cumulative_samples_pl
 richness_input <- read_tsv(processed_summary_path, show_col_types = FALSE)
 richness_markers <- sort(unique(richness_input$marker))
 
+# Frequency spectrum: f_k is the number of species observed in exactly k
+# samples. Show f1--f10 separately and pool all higher frequencies into >10.
+frequency_spectrum_counts <- prevalence_histogram %>%
+  mutate(
+    frequency = if_else(sample_count > 10, ">10", as.character(sample_count)),
+    frequency = factor(frequency, levels = c(as.character(1:10), ">10"))
+  ) %>%
+  group_by(marker, cohort, frequency) %>%
+  summarise(species_count = sum(species_count), .groups = "drop")
+
+frequency_spectrum <- frequency_spectrum_counts %>%
+  group_by(marker, cohort) %>%
+  mutate(species_fraction = species_count / sum(species_count)) %>%
+  ungroup()
+
+plot_frequency_spectrum <- function(data) {
+  data %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(frequency, species_fraction, fill = cohort)) +
+  geom_col(position = position_dodge(width = .8), width = .75) +
+  facet_wrap(~ marker, scales = "free_y") +
+  scale_fill_manual(values = c(all = vibrant_colours[1], `human-gut` = vibrant_colours[2])) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Frequency (species prevalence)",
+    y = expression(f[k]~"(% of species)"),
+    fill = "Cohort"
+  ) +
+  theme_cowplot() +
+  theme(
+    legend.position = "bottom"
+  )
+}
+
+frequency_spectrum_plot <- plot_frequency_spectrum(frequency_spectrum)
+ggsave(here(output_dir, "frequency_spectrum.png"), frequency_spectrum_plot,
+       width = 20, height = 12, dpi = 300, bg = "white")
+
+frequency_spectrum_no_f1 <- frequency_spectrum_counts %>%
+  filter(frequency != "1") %>%
+  group_by(marker, cohort) %>%
+  mutate(species_fraction = species_count / sum(species_count)) %>%
+  ungroup()
+frequency_spectrum_no_f1_plot <- plot_frequency_spectrum(frequency_spectrum_no_f1)
+ggsave(here(output_dir, "frequency_spectrum_no_f1.png"), frequency_spectrum_no_f1_plot,
+       width = 20, height = 12, dpi = 300, bg = "white")
+
+# Prevalence-normalized spectrum. The x-axis is the fraction of samples in the
+# cohort containing a species (k/N), making prevalence comparable when cohort
+# sample sizes differ. The y-axis is the percentage of species at that
+# prevalence and includes f1.
+prevalence_spectrum <- prevalence_histogram %>%
+  inner_join(cohort_samples, by = "cohort") %>%
+  group_by(marker, cohort) %>%
+  mutate(
+    prevalence = sample_count / n_samples,
+    species_fraction = species_count / sum(species_count)
+  ) %>%
+  ungroup()
+
+prevalence_spectrum_plot <- prevalence_spectrum %>%
+  mutate(marker = marker_label(marker)) %>%
+  ggplot(aes(prevalence, species_fraction, colour = cohort, group = cohort)) +
+  geom_line(linewidth = .6) +
+  geom_point(size = .7) +
+  facet_wrap(~ marker, scales = "free_y") +
+  scale_colour_manual(values = c(all = vibrant_colours[1], `human-gut` = vibrant_colours[2])) +
+  scale_x_continuous(trans = "log10", labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = "Prevalence (fraction of cohort samples)",
+    y = expression(f[k]~"(% of species)"),
+    colour = "Cohort"
+  ) +
+  theme_cowplot() +
+  theme(legend.position = "bottom")
+ggsave(here(output_dir, "prevalence_spectrum.png"), prevalence_spectrum_plot,
+       width = 20, height = 12, dpi = 300, bg = "white")
+
 get_frequency_table <- function(marker_name, cohort_name) {
   stratum_name <- if (cohort_name == "all") "all" else "human_all"
   richness_input %>%
