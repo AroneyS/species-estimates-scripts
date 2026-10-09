@@ -53,7 +53,8 @@ wrangling_path <- here(output_dir, "wrangling.RData")
 processed_summary_path <- here(input_dir, "species_count_complete.tsv")
 metadata_path <- here("results", "sample_metadata", "sandpiper_39_sample_metadata_with_organism.tsv")
 wrangling_objects <- c("summary", "cluster_summary", "cumulative_year",
-                       "prevalence_histogram", "cohort_samples")
+                       "prevalence_histogram", "cohort_samples",
+                       "marker_distances", "globdb_cluster_counts")
 
 # Rebuild the cache whenever process_species_estimation.py rewrites its output
 if (file.exists(wrangling_path) &&
@@ -134,6 +135,18 @@ if (file.exists(wrangling_path) &&
     summarise(all = n(), `human-gut` = sum(organism == "human gut metagenome", na.rm = TRUE)) %>%
     pivot_longer(everything(), names_to = "cohort", values_to = "n_samples")
 
+  marker_distances <- read_tsv(
+    here("results", "globdb_marker_distances", "GlobDB_r232_3000.tsv"),
+    show_col_types = FALSE
+  ) %>%
+    filter(marker %in% unique(cluster_summary$marker))
+
+  globdb_cluster_counts <- read_tsv(
+    here("results", "globdb_marker_distances", "GlobDB_r232_clusters.tsv"),
+    show_col_types = FALSE
+  ) %>%
+    filter(marker %in% unique(cluster_summary$marker))
+
   rm(species_counts)
   save(list = wrangling_objects, file = wrangling_path)
 }
@@ -159,6 +172,20 @@ cluster_summary %>%
     values_from = n,
     values_fill = 0
   )
+
+# GlobDB cluster retention at the 2-bp cutoff
+globdb_cluster_counts %>%
+  mutate(cluster_percent = 100 * clusters / species) %>%
+  summarise(
+    min_percent = min(cluster_percent),
+    max_percent = max(cluster_percent),
+    median_percent = median(cluster_percent),
+    .groups = "drop"
+  )
+
+globdb_cluster_counts %>%
+  mutate(cluster_percent = 100 * clusters / species) %>%
+  select(marker, species, clusters, cluster_percent)
 
 # Cluster type proportions
 cluster_summary %>%
@@ -907,10 +934,6 @@ ggsave(here(output_dir, "frequency_ratios.png"), frequency_ratio_plot,
 # From scripts/globdb_marker_distances.py: distances from one randomly selected
 # marker window in each sampled species to one representative window from every
 # GlobDB species (capped at 15).
-marker_distances <- read_tsv(
-    here("results", "globdb_marker_distances", "GlobDB_r232_3000.tsv"), show_col_types = FALSE
-  ) %>%
-  filter(marker %in% unique(cluster_summary$marker))
 max_distance <- max(marker_distances$distance)
 clustering_cutoff <- 2
 
@@ -943,14 +966,10 @@ all_pair_histogram <- all_pair_histogram_data %>%
   theme_cowplot()
 
 # Number of smafa clusters among all GlobDB species at the 2-bp cutoff.
-globdb_cluster_counts <- read_tsv(
-  here("results", "globdb_marker_distances", "GlobDB_r232_clusters.tsv"),
-  show_col_types = FALSE
-) %>%
-  filter(marker %in% unique(cluster_summary$marker)) %>%
+globdb_cluster_counts_plot <- globdb_cluster_counts %>%
   mutate(marker = marker_label(marker))
 
-cluster_count_plot <- globdb_cluster_counts %>%
+cluster_count_plot <- globdb_cluster_counts_plot %>%
   ggplot(aes(y = marker)) +
   geom_col(aes(x = species, fill = "Species"), width = .75, colour = "white") +
   geom_col(aes(x = clusters, fill = "Clusters"), width = .55) +
