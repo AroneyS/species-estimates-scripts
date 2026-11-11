@@ -18,3 +18,8 @@ Entry template:
 - Ran: retrofit of CLAUDE.md and notes/ onto existing project (aims from user's 2026-04-23 notes and figure captions; project started 2026-04-23)
 - Found: GTDB r232 runs (20260423-20260603) superseded by GlobDB r232 renew runs (20260703 test, 20260704 full)
 - Decided: 20260704 run logged as adopted; f1 correction, GlobDB rarefaction, pigeonhole banding and GlobDB distances logged as ongoing, by agent from user notes (user to review)
+
+## 2026-11-11: aims updated, f1 error-rate approach scoped
+
+- Found: no follow-on paper; related: doi:10.1038/s41564-026-02314-6
+- Decided: next step is f1-error-correction via codon-position/synonymy of mismatches vs nearest neighbour, by user (idea) and agent (entry wording)

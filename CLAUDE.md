@@ -2,7 +2,7 @@
 
 ## Aims
 
-<!-- Follows on from: paper/DOI not given. -->
+<!-- No direct follow-on paper. Similar in vein: https://doi.org/10.1038/s41564-026-02314-6 -->
 
 1. Estimate the number of prokaryotic species in the Sandpiper database by clustering SingleM OTU window sequences (2 bp divergence, 60 bp windows, 13 single-copy markers across both domains).
 2. Compare cluster richness with GlobDB r232 (genome-linked clusters, GlobDB self-clustering at 2 bp) and report richness estimates (breakaway; richness code based on Amy Willis scripts), accumulation by collection year, and rarefaction.

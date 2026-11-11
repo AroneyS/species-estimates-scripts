@@ -26,11 +26,12 @@ Entry template:
 
 ### f1-error-correction
 
-- Question: is human gut f1/f2 inflation due to sequencing-error singletons, and can it be corrected?
-- Data and cohort: 20260704 clusters; high- vs low-quality sample subsets; simulated 1M samples from 1M/10M/100M/1B species pools
-- Method: compare f1 in quality strata; simulation
-- Decision rule: if f1/f2 converges across strata or a correction factor reproduces simulated richness, adopt
+- Question: is human gut f1/f2 inflation due to sequencing-error singletons, and can an error rate be estimated?
+- Data and cohort: 20260704 sequences (pre-clustering uniques and clusters); human gut vs all; optionally high- vs low-quality subsets and simulation (1M samples from 1M/10M/100M/1B species pools)
+- Method: for f1, f2, f3, ... (by n_samples), compare each sequence to its nearest more abundant sequence (and to GlobDB genome windows where within 2 bp): codon position of mismatches, synonymous vs non-synonymous, stop-gain, transition/transversion. Errors predict ~uniform codon positions and non-synonymous excess; real variants predict 3rd-position/synonymous excess. Mixture model against high-frequency reference gives error fraction of f1. New dependencies: none expected.
+- Decision rule: if f1 differs from f2/f3+ in the expected direction and the estimated error fraction is stable across parent-abundance strata and markers, use it to correct f1; otherwise drop
 - Status: proposed, 2026-11-11
+- Location: scripts/checks/f1-error-correction/ (to create)
 
 ### globdb-rarefaction-by-date
 
