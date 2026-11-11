@@ -985,3 +985,121 @@ globdb_distance_figure <- plot_grid(all_pair_histogram, cluster_count_plot,
 ggsave(here(output_dir, "globdb_marker_distances.png"), globdb_distance_figure,
        width = 18, height = 10, dpi = 300, bg = "white")
 ```
+
+```{r f1_error_estimates}
+#-------------------------------------------------------------------------------
+#--- Figure S11: sequencing-error signature of rare sequences and error estimates
+#-------------------------------------------------------------------------------
+# From scripts/f1_error_estimation.smk: single-nucleotide codon changes of each
+# sequence vs its more abundant cluster representative, by sample-count class.
+# Error fraction = (p_ref - p_obs) / (p_ref - p_err), with p_ref from f100+ pairs
+# (same scope, or all samples) and p_err the uniform-substitution expectation.
+f1_input_dir <- here("results", "f1_error_estimation", "20261111")
+f1_f_levels <- c("f1", "f2", "f3", "f4-9", "f10-99", "f100+")
+f1_scope_labels <- c(all = "All samples", human_gut = "Human gut")
+f1_statistic_labels <- c(codon_position = "Codon position 3", synonymous = "Synonymous", stop_codon = "Stop gain")
+
+f1_signature <- read_tsv(here(f1_input_dir, "collated_signature.tsv"), show_col_types = FALSE)
+f1_estimates <- bind_rows(
+  read_tsv(here(f1_input_dir, "error_estimates.tsv"), show_col_types = FALSE),
+  read_tsv(here(f1_input_dir, "error_estimates_all_reference.tsv"), show_col_types = FALSE)
+) %>%
+  # all-samples scope is identical under both references; keep one
+  filter(!(scope == "all" & reference == "all"))
+
+# Observed mismatch rates per marker: pooled over parent classes
+f1_observed <- f1_signature %>%
+  group_by(scope, marker, f_class, single_read) %>%
+  summarise(across(c(n_pairs, n_single_nt, pos3, syn, stop), sum), .groups = "drop") %>%
+  filter(n_single_nt > 0) %>%
+  transmute(
+    scope, marker, f_class, single_read, n_pairs, n_single_nt,
+    `Codon position 3` = pos3 / n_single_nt,
+    Synonymous = syn / n_single_nt,
+    `Stop gain` = stop / n_single_nt
+  ) %>%
+  pivot_longer(c(`Codon position 3`, Synonymous, `Stop gain`), names_to = "statistic", values_to = "rate") %>%
+  mutate(
+    f_class = factor(f_class, levels = f1_f_levels),
+    scope = factor(f1_scope_labels[scope], levels = f1_scope_labels),
+    read_type = if_else(single_read, "Single-read", "Multi-read"),
+    statistic = factor(statistic, levels = f1_statistic_labels)
+  )
+
+f1_error_estimates_figure <- function(observed, estimates, signature) {
+  # a) observed mismatch rates; dotted line = expectation under uniform random substitution
+  expected <- signature %>%
+    filter(n_single_nt > 0) %>%
+    summarise(syn = sum(exp_syn) / sum(n_single_nt), stop = sum(exp_stop) / sum(n_single_nt))
+  expectation <- tibble(
+    statistic = factor(f1_statistic_labels[c("codon_position", "synonymous", "stop_codon")], levels = f1_statistic_labels),
+    expected = c(1 / 3, expected$syn, expected$stop)
+  )
+
+  plot_a <- observed %>%
+    ggplot(aes(f_class, rate, colour = read_type)) +
+    geom_hline(data = expectation, aes(yintercept = expected), linetype = "dotted", colour = "grey30") +
+    geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.7), alpha = 0.4, size = 1) +
+    stat_summary(aes(group = read_type), fun = median, geom = "point", shape = 95, size = 6,
+                 position = position_dodge(width = 0.7)) +
+    facet_grid(statistic ~ scope, scales = "free_y") +
+    scale_colour_manual(values = c("Single-read" = vibrant_colours[1], "Multi-read" = vibrant_colours[2])) +
+    labs(x = "Sample-count class", y = "Fraction of 1-nt codon changes", colour = NULL) +
+    theme_cowplot() +
+    theme(legend.position = "top")
+
+  # b) estimated error fraction, single-read sequences, by estimator and reference
+  panel_labels <- c(
+    "all/same_scope" = "All samples",
+    "human_gut/same_scope" = "Human gut\n(own f100+ reference)",
+    "human_gut/all" = "Human gut\n(all-sample f100+ reference)"
+  )
+  est <- estimates %>%
+    filter(parent_class == "all", single_read, f_class %in% c("f1", "f2", "f3", "f4-9")) %>%
+    mutate(
+      panel = factor(panel_labels[paste(scope, reference, sep = "/")], levels = panel_labels),
+      f_class = factor(f_class, levels = f1_f_levels),
+      statistic = factor(f1_statistic_labels[statistic], levels = f1_statistic_labels)
+    )
+
+  plot_b <- est %>%
+    ggplot(aes(f_class, error_fraction, colour = statistic)) +
+    geom_hline(yintercept = c(0, 1), colour = "grey80") +
+    geom_point(position = position_jitterdodge(jitter.width = 0.15, dodge.width = 0.7), alpha = 0.4, size = 1) +
+    stat_summary(aes(group = statistic), fun = median, geom = "point", shape = 95, size = 6,
+                 position = position_dodge(width = 0.7)) +
+    facet_wrap(~panel, nrow = 1) +
+    coord_cartesian(ylim = c(-0.1, 1.1)) +
+    scale_colour_manual(values = setNames(bright_colours[1:3], f1_statistic_labels)) +
+    labs(x = "Sample-count class", y = "Estimated error fraction", colour = NULL) +
+    theme_cowplot() +
+    theme(legend.position = "top")
+
+  list(
+    plot = plot_grid(plot_a, plot_b, ncol = 1, labels = "auto", rel_heights = c(1.6, 1)),
+    data_a = observed,
+    data_b = est
+  )
+}
+
+f1_output_subdir <- here(output_dir, "f1_error_estimates")
+dir.create(f1_output_subdir, recursive = TRUE, showWarnings = FALSE)
+
+f1_result <- f1_error_estimates_figure(f1_observed, f1_estimates, f1_signature)
+for (ext in c("png", "pdf", "svg")) {
+  ggsave(here(f1_output_subdir, str_c("figure_S11_f1_error_estimates.", ext)), f1_result$plot,
+         width = 11, height = 11, dpi = 300, bg = "white")
+}
+write_tsv(f1_result$data_a, here(f1_output_subdir, "figure_S11_f1_error_estimates_observed.tsv"))
+write_tsv(f1_result$data_b, here(f1_output_subdir, "figure_S11_f1_error_estimates_estimates.tsv"))
+
+# Median and range of the error fraction across markers
+f1_result$data_b %>%
+  group_by(panel, f_class, statistic) %>%
+  summarise(
+    n_markers = n(), n_single_nt = sum(n_single_nt),
+    median_error_fraction = median(error_fraction), min = min(error_fraction), max = max(error_fraction),
+    .groups = "drop"
+  ) %>%
+  write_tsv(here(f1_output_subdir, "error_estimates_stats.tsv"))
+```

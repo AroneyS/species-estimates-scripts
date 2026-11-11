@@ -41,8 +41,8 @@ Entry template:
 - Question: is human gut f1/f2 inflation due to sequencing-error singletons, and can an error rate be estimated?
 - Data and cohort: 20260704 run (GlobDB r232 metapackage v4), all samples and human gut (organism "human gut metagenome"), 13 markers, 100% of pairs
 - Method: members vs cluster representative (within 2 bp, more abundant); codon position, synonymous and stop-gain mismatch rates by f class, single-read status and parent abundance; two-component mixture against the f100+ reference (same-scope and all-scope reference streams). SingleM/smafa versions not recorded. Caveats: study not controlled, Illumina only, codons with N/gaps excluded, standard genetic code, human gut f100+ reference thin and possibly error-contaminated, stop-gain depleted in all classes
-- Location: scripts/f1_error_estimation.smk, f1_error_signature.py, counts_table.py, f1_error_estimates.py, tests in scripts/tests/; figure scripts/f1_error_estimation.qmd (Figure S11); copied from scripts/checks/f1-error-correction/
-- Outputs: results/f1_error_estimation/20261111/, results/f1_error_estimation_qmd/20261111/
+- Location: scripts/f1_error_estimation.smk, f1_error_signature.py, counts_table.py, f1_error_estimates.py, tests in scripts/tests/; Figure S11 in scripts/species_estimation.qmd (chunk f1_error_estimates); copied from scripts/checks/f1-error-correction/
+- Outputs: results/f1_error_estimation/20261111/, results/f1_error_estimation_qmd/20261111/ (standalone render), results/species_estimation_qmd/20261007/f1_error_estimates/
 - Outcome: inconclusive. Single-read f1 error fraction (median over 13 markers) ~0.52-0.53 all samples (position/synonymous), ~0.93-0.96 human gut; stop-codon estimator lower (0.13 / 0.28) and unreliable
 - Adopted: 2026-11-11
 

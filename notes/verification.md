@@ -56,3 +56,8 @@ Entry template:
 - Ran: results/f1_error_estimation/20261111/ finished on its own (83/83 steps, 2026-11-11 17:06) once the Lustre lock on S3.8/S3.9/S3.10 deduplicated.fasta cleared; no resume needed. scripts/f1_error_estimation.qmd rendered -> results/f1_error_estimation_qmd/20261111/error_estimates/.
 - Found: median over 13 markers, single-read f1/f2/f3: all samples 0.52/0.32/0.25 (codon position), 0.53/0.33/0.26 (synonymous); human gut 0.93/0.92/0.89 and 0.96/0.93/0.91 (own reference), 0.96/0.95/0.93 and 0.98/0.97/0.94 (all-sample reference). Some human gut estimates exceed 1 (up to 1.07).
 - Decided: todo item removed (superseded), by agent; interpretation pending user.
+
+## 2026-11-12: Figure S11 moved into the main qmd
+
+- Ran: appended chunk f1_error_estimates to scripts/species_estimation.qmd (f1_-prefixed objects); removed scripts/f1_error_estimation.qmd. Full render not possible in the pixi r env (breakaway not installed); chunk run standalone with the main setup, estimates identical to the earlier render (scratch test).
+- Decided: by user (move requested). Standalone render outputs under results/f1_error_estimation_qmd/20261111/ left in place.

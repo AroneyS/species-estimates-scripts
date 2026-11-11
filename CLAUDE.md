@@ -45,7 +45,7 @@ pixi run snakemake --snakefile scripts/f1_error_estimation.smk --directory resul
 pixi run -e default python scripts/globdb_cluster_counts.py --output results/globdb_marker_distances/...
 ```
 
-Notebooks: `scripts/species_estimation.qmd` (figures 1-4, S1-S10), `scripts/pidgeonhole_testing.qmd`, `scripts/f1_error_estimation.qmd` (Figure S11).
+Notebooks: `scripts/species_estimation.qmd` (figures 1-4, S1-S11; S11 reads results/f1_error_estimation), `scripts/pidgeonhole_testing.qmd`.
 
 Pixi environments: `default` (main), `r`
 
