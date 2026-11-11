@@ -11,9 +11,11 @@ scripts/species_estimation_files/
 *.pyc
 
 .snakemake/
+.quarto/
 
 *.html
 *.pdf
 *.xlsx
 *.png
 
+notes/todo.md

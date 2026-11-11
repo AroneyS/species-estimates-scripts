@@ -136,7 +136,7 @@ if (file.exists(wrangling_path) &&
     pivot_longer(everything(), names_to = "cohort", values_to = "n_samples")
 
   marker_distances <- read_tsv(
-    here("results", "globdb_marker_distances", "GlobDB_r232_3000.tsv"),
+    here("results", "globdb_marker_distances", "GlobDB_r232_50000.tsv"),
     show_col_types = FALSE
   ) %>%
     filter(marker %in% unique(cluster_summary$marker))
