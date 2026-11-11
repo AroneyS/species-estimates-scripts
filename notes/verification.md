@@ -45,3 +45,14 @@ Entry template:
 
 - Ran: copied f1_error_signature.py, counts_table.py, f1_error_estimates.py from scripts/checks/f1-error-correction/ to scripts/ (tests to scripts/tests/, 13 pass); new scripts/f1_error_estimation.smk and scripts/f1_error_estimation.qmd (Figure S11). Added --reference-scope (all-scope f100+ reference) as a second estimate stream. Full run launched locally (12 cores, 60 GB cap): results/f1_error_estimation/20261111/. Figure test render on S3.1 only (scratch).
 - Decided: entry moved ongoing -> confirmed, by user ("confirm it"); outcome left inconclusive pending review. Module code under scripts/checks/ left unchanged.
+
+## 2026-11-11: full f1 error run stalled on three unreadable inputs
+
+- Ran: scripts/f1_error_estimation.smk, results/f1_error_estimation/20261111/. 47/83 steps done (rows + counts for 10 markers, both scopes); S3.8, S3.9, S3.10 rows_all hung >1.5 h in a Lustre lock wait (ldlm_completion_ast) opening deduplicated.fasta; signature steps blocked by the memory budget.
+- Decided: leave running (user, option 1) and check tomorrow. Note the launching PBS job (27938705) has ~4.5 h of walltime left, so it will likely be gone by then; resume via notes/todo.md.
+
+## 2026-11-12: full f1 error run completed, Figure S11 rendered
+
+- Ran: results/f1_error_estimation/20261111/ finished on its own (83/83 steps, 2026-11-11 17:06) once the Lustre lock on S3.8/S3.9/S3.10 deduplicated.fasta cleared; no resume needed. scripts/f1_error_estimation.qmd rendered -> results/f1_error_estimation_qmd/20261111/error_estimates/.
+- Found: median over 13 markers, single-read f1/f2/f3: all samples 0.52/0.32/0.25 (codon position), 0.53/0.33/0.26 (synonymous); human gut 0.93/0.92/0.89 and 0.96/0.93/0.91 (own reference), 0.96/0.95/0.93 and 0.98/0.97/0.94 (all-sample reference). Some human gut estimates exceed 1 (up to 1.07).
+- Decided: todo item removed (superseded), by agent; interpretation pending user.
