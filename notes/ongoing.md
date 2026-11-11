@@ -30,8 +30,9 @@ Entry template:
 - Data and cohort: 20260704 sequences (pre-clustering uniques and clusters); human gut vs all; optionally high- vs low-quality subsets and simulation (1M samples from 1M/10M/100M/1B species pools)
 - Method: for f1, f2, f3, ... (by n_samples), compare each sequence to its nearest more abundant sequence (and to GlobDB genome windows where within 2 bp): codon position of mismatches, synonymous vs non-synonymous, stop-gain, transition/transversion. Errors predict ~uniform codon positions and non-synonymous excess; real variants predict 3rd-position/synonymous excess. Mixture model against high-frequency reference gives error fraction of f1. New dependencies: none expected.
 - Decision rule: if f1 differs from f2/f3+ in the expected direction and the estimated error fraction is stable across parent-abundance strata and markers, use it to correct f1; otherwise drop
-- Status: proposed, 2026-11-11
-- Location: scripts/checks/f1-error-correction/ (to create)
+- Caveats: study/project not controlled for (pseudoreplication; recurrent errors within a batch can inflate f2/f3); all Illumina; windows are 60 bp in frame, codons with N/gaps excluded; standard genetic code; parent = cluster representative (within 2 bp, more abundant), not guaranteed nearest neighbour; first test uses all samples, human gut split still to do
+- Status: in progress (markers S3.1, S3.2 first), 2026-11-11
+- Location: scripts/checks/f1-error-correction/
 
 ### globdb-rarefaction-by-date
 

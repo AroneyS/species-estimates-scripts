@@ -23,3 +23,8 @@ Entry template:
 
 - Found: no follow-on paper; related: doi:10.1038/s41564-026-02314-6
 - Decided: next step is f1-error-correction via codon-position/synonymy of mismatches vs nearest neighbour, by user (idea) and agent (entry wording)
+
+## 2026-11-11: f1-error-correction module written
+
+- Ran: unit tests only (5 pass); snakemake dry run for S3.1 and S3.2 -> results/checks/f1-error-correction/20261111/
+- Decided: pairs are cluster member vs representative (agent's simplification of "nearest more abundant"); stratified by f class, single-read (sum_hits == n_occurrences) and parent abundance; user asked for hits stratification, study ignored (caveat), Illumina only
