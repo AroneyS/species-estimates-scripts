@@ -19,3 +19,4 @@ scripts/species_estimation_files/
 *.png
 
 notes/todo.md
+scripts/f1_error_estimation_files/

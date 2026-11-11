@@ -41,10 +41,11 @@ pixi run scripts/run_species_estimation.py --input-archive-otu-table-list data/s
 pixi run scripts/process_species_estimation.py -o <out>.tsv results/species_estimation/<YYYYMMDD>
 pixi run snakemake --snakefile scripts/pidgeonhole_testing.smk --directory results/pidgeonhole_testing/<YYYYMMDD> --cores 8
 pixi run -e default python scripts/globdb_marker_distances.py --inter-species N --output results/globdb_marker_distances/...
+pixi run snakemake --snakefile scripts/f1_error_estimation.smk --directory results/f1_error_estimation/<YYYYMMDD> --cores 12 --resources mem_mb=60000
 pixi run -e default python scripts/globdb_cluster_counts.py --output results/globdb_marker_distances/...
 ```
 
-Notebooks: `scripts/species_estimation.qmd` (figures 1-4, S1-S10), `scripts/pidgeonhole_testing.qmd`.
+Notebooks: `scripts/species_estimation.qmd` (figures 1-4, S1-S10), `scripts/pidgeonhole_testing.qmd`, `scripts/f1_error_estimation.qmd` (Figure S11).
 
 Pixi environments: `default` (main), `r`
 

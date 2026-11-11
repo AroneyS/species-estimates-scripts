@@ -3,7 +3,9 @@
 import unittest
 import polars as pl
 from polars.testing import assert_frame_equal
-from f1_error_signature import pipeline
+import os
+import tempfile
+from f1_error_signature import pipeline, combine, build_pairs, summarise_pairs
 
 INPUT_COLUMNS = {
     "rep": str, "member": str, "n_occurrences": int, "sum_hits": int, "rep_n_occurrences": int,
@@ -53,6 +55,35 @@ class Tests(unittest.TestCase):
         input = pl.DataFrame([[REP, mutate(REP, 1, "GGG"), 1, 1, 50]], schema=INPUT_COLUMNS, orient="row")
         row = pipeline(input).row(0, named=True)
         self.assertEqual((row["n_codons_multi_nt"], row["n_single_nt"]), (1, 0))
+
+    def test_combine_sums_strata(self):
+        input = pl.DataFrame([[REP, mutate(REP, 1, "GCC"), 1, 1, 50]], schema=INPUT_COLUMNS, orient="row")
+        out = pipeline(input)
+        combined = combine(pl.concat([out, out]))
+        self.assertEqual(combined.row(0, named=True)["n_pairs"], 2)
+        self.assertEqual(combined.row(0, named=True)["pos3"], 2)
+
+    def test_build_pairs_normalises_gaps_and_filters_abundance(self):
+        gapped = mutate(REP, 1, "G-T")
+        normalised = gapped.replace("-", "N")
+        member2 = mutate(REP, 2, "GCC")
+        with tempfile.TemporaryDirectory() as d:
+            counts = os.path.join(d, "counts.tsv")
+            clusters = os.path.join(d, "clusters.tsv")
+            out = os.path.join(d, "pairs.parquet")
+            pl.DataFrame({
+                "sequence": [REP, normalised, member2],
+                "n_occurrences": [50, 1, 60],  # member2 more abundant than its rep: dropped
+                "sum_hits": [100, 1, 100],
+            }).write_csv(counts, separator="\t")
+            with open(clusters, "w") as fh:
+                fh.write(f"{REP}\t{REP}\n{REP}\t{normalised}\n{REP}\t{member2}\n")
+            self.assertEqual(build_pairs(counts, clusters, out), 1)
+            row = pl.read_parquet(out).row(0, named=True)
+            self.assertEqual(row["member"], normalised)
+            self.assertEqual(row["rep_n_occurrences"], 50)
+            summary = summarise_pairs(out, batch_rows=1)
+            self.assertEqual(summary["n_pairs_ambiguous"].sum(), 1)
 
     def test_empty(self):
         out = pipeline(pl.DataFrame(schema=INPUT_COLUMNS))

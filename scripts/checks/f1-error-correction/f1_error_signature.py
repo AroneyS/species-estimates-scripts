@@ -9,8 +9,11 @@ status and representative abundance.
 Sequencing errors predict ~uniform mismatches over codon positions, non-synonymous
 excess and stop gains; real variation predicts third-position/synonymous excess.
 
-Inputs: dedup table (seq_id, unknown, hits, n_occurrences, sum_hits, sequence) and
-smafa clusters.tsv (representative TAB member, no header). Windows are 60 bp, in frame.
+Inputs: counts table (sequence, n_occurrences, sum_hits; gaps already converted to N, see
+counts_table.py) and smafa clusters.tsv (representative TAB member, no header; members
+have gaps as N, representatives may keep gaps). Windows are 60 bp, in frame.
+Memory: pairs are joined once and written to a temporary parquet, then summarised in
+batches, so 100% of pairs fit in well under 64 GB.
 Codons containing N or gaps in either sequence are excluded from mismatch counts.
 Standard genetic code (table 1); ignores table 4/25 TGA reassignments.
 """
@@ -19,6 +22,7 @@ import sys
 import argparse
 import logging
 import itertools
+import os
 import polars as pl
 
 WINDOW = 60
@@ -159,33 +163,52 @@ def pipeline(pairs: pl.DataFrame) -> pl.DataFrame:
     return out.with_columns(pl.col(fill).fill_null(0)).sort(STRATA)
 
 
-def load_pairs(dedup_table: str, clusters: str, sample_fraction: float, seed: int) -> pl.DataFrame:
-    """Sample non-representative members from clusters and attach counts and parent abundance."""
-    dedup = pl.scan_csv(dedup_table, separator="\t").select("sequence", "n_occurrences", "sum_hits")
-    clu = pl.scan_csv(clusters, separator="\t", has_header=False, new_columns=["rep", "member"])
+def combine(counts: pl.DataFrame) -> pl.DataFrame:
+    """Sum per-stratum counts (e.g. across batches)."""
+    numeric = [c for c in counts.columns if c not in STRATA]
+    return counts.group_by(STRATA).agg(pl.col(numeric).sum()).sort(STRATA)
 
-    modulus = 1_000_000
-    keep = (pl.col("sequence").hash(seed) % modulus) < int(sample_fraction * modulus)
-    members = (
-        dedup.filter((f_class_expr() == REF_CLASS) | keep)
-        .rename({"sequence": "member"})
-    )
+
+def build_pairs(counts_table: str, clusters: str, output_parquet: str, sample_fraction: float = 1.0, seed: int = 0) -> int:
+    """
+    Join non-representative cluster members with their counts and their representative's
+    counts, keeping pairs whose representative is more abundant. Streams to parquet.
+    Sequences absent from the counts table (e.g. not seen in the scope) drop out.
+    """
+    counts = pl.scan_csv(counts_table, separator="\t").select("sequence", "n_occurrences", "sum_hits")
+    clu = pl.scan_csv(clusters, separator="\t", has_header=False, new_columns=["rep", "member"]).with_columns(
+        pl.col("rep").str.replace_all("-", "N"), pl.col("member").str.replace_all("-", "N"))
+
+    members = counts.rename({"sequence": "member"})
+    reps = counts.select(rep="sequence", rep_n_occurrences="n_occurrences")
+    pairs = clu.filter(pl.col("rep") != pl.col("member"))
+    if sample_fraction < 1.0:
+        modulus = 1_000_000
+        pairs = pairs.filter((pl.col("member").hash(seed) % modulus) < int(sample_fraction * modulus))
     pairs = (
-        clu.filter(pl.col("rep") != pl.col("member"))
-        .join(members, on="member", how="inner")
-        .collect(engine="streaming")
+        pairs.join(members, on="member", how="inner")
+        .join(reps, on="rep", how="inner")
+        .filter(pl.col("rep_n_occurrences") > pl.col("n_occurrences"))
     )
-    reps = pairs.select("rep").unique().lazy()
-    rep_counts = (
-        dedup.join(reps, left_on="sequence", right_on="rep", how="semi")
-        .select(rep="sequence", rep_n_occurrences="n_occurrences")
-        .collect(engine="streaming")
-    )
-    pairs = pairs.join(rep_counts, on="rep", how="inner").filter(
-        pl.col("rep_n_occurrences") > pl.col("n_occurrences")
-    )
-    logging.info("pairs with a more abundant representative: %d", pairs.height)
-    return pairs
+    pairs.sink_parquet(output_parquet, compression="zstd")
+    n = pl.scan_parquet(output_parquet).select(pl.len()).collect().item()
+    logging.info("pairs with a more abundant representative: %d", n)
+    return n
+
+
+def summarise_pairs(pairs_parquet: str, batch_rows: int = 1_000_000) -> pl.DataFrame:
+    n = pl.scan_parquet(pairs_parquet).select(pl.len()).collect().item()
+    results = []
+    for offset in range(0, n, batch_rows):
+        batch = pl.scan_parquet(pairs_parquet).slice(offset, batch_rows).collect()
+        results.append(pipeline(batch))
+        logging.info("summarised %d / %d pairs", min(offset + batch_rows, n), n)
+    if not results:
+        return pipeline(pl.DataFrame(schema=PAIR_COLUMNS))
+    return combine(pl.concat(results))
+
+
+PAIR_COLUMNS = {"rep": str, "member": str, "n_occurrences": int, "sum_hits": int, "rep_n_occurrences": int}
 
 
 def main(arguments):
@@ -193,12 +216,14 @@ def main(arguments):
     parser.add_argument("--debug", help="output debug information", action="store_true")
     parser.add_argument("--quiet", help="only output errors", action="store_true")
 
-    parser.add_argument("--dedup-table", required=True, help="TSV from deduplicated.fasta (with header)")
+    parser.add_argument("--counts-table", required=True, help="TSV: sequence, n_occurrences, sum_hits")
     parser.add_argument("--clusters", required=True, help="smafa clusters.tsv (rep TAB member)")
     parser.add_argument("--marker", required=True, help="Marker name, written to output")
-    parser.add_argument("--sample-fraction", type=float, default=0.02,
-                        help="Hash-sampled fraction of members with n_occurrences < 100 (f100+ always kept)")
+    parser.add_argument("--scope", required=True, help="Sample scope (e.g. all, human_gut), written to output")
+    parser.add_argument("--sample-fraction", type=float, default=1.0,
+                        help="Hash-sampled fraction of members (default 1.0 = all)")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-rows", type=int, default=1_000_000, help="Pairs summarised per batch")
     parser.add_argument("--output", required=True, help="Output TSV")
 
     args = parser.parse_args(arguments)
@@ -212,10 +237,16 @@ def main(arguments):
     logging.basicConfig(level=loglevel, format="%(asctime)s %(levelname)s: %(message)s", datefmt="%Y/%m/%d %I:%M:%S %p")
     logging.info(args)
 
-    pairs = load_pairs(args.dedup_table, args.clusters, args.sample_fraction, args.seed)
-    result = pipeline(pairs).with_columns(
-        marker=pl.lit(args.marker), sample_fraction=pl.lit(args.sample_fraction))
-    result.write_csv(args.output, separator="\t")
+    pairs_parquet = args.output + ".pairs.parquet.tmp"
+    try:
+        build_pairs(args.counts_table, args.clusters, pairs_parquet, args.sample_fraction, args.seed)
+        result = summarise_pairs(pairs_parquet, args.batch_rows)
+    finally:
+        if os.path.exists(pairs_parquet):
+            os.unlink(pairs_parquet)
+    result.with_columns(
+        scope=pl.lit(args.scope), marker=pl.lit(args.marker), sample_fraction=pl.lit(args.sample_fraction)
+    ).write_csv(args.output, separator="\t")
 
 
 if __name__ == "__main__":
