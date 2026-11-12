@@ -47,7 +47,9 @@ pixi run -e default python scripts/globdb_cluster_counts.py --output results/glo
 
 Notebooks: `scripts/species_estimation.qmd` (figures 1-4, S1-S11; S11 reads results/f1_error_estimation), `scripts/pidgeonhole_testing.qmd`.
 
-Pixi environments: `default` (main), `r`
+Before re-rendering any .qmd, set `output_dir` in its setup chunk to a new dated directory (YYYYMMDD). The notebook regenerates every figure and table in `output_dir`, so rendering with the existing date overwrites earlier outputs.
+
+Pixi environments: `default` (main), `r`. `breakaway` is not a conda dependency: after the `r` environment is (re)built, run `pixi run -e r install-breakaway`.
 
 ## Checks: supporting code per path
 

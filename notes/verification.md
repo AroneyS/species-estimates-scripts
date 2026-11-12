@@ -61,3 +61,9 @@ Entry template:
 
 - Ran: appended chunk f1_error_estimates to scripts/species_estimation.qmd (f1_-prefixed objects); removed scripts/f1_error_estimation.qmd. Full render not possible in the pixi r env (breakaway not installed); chunk run standalone with the main setup, estimates identical to the earlier render (scratch test).
 - Decided: by user (move requested). Standalone render outputs under results/f1_error_estimation_qmd/20261111/ left in place.
+
+## 2026-11-12: install-breakaway and full render of species_estimation.qmd (overwrote 20261007 outputs)
+
+- Ran: `pixi run -e r install-breakaway` (GitHub master, version not recorded; the r env had been rebuilt 2026-11-11 without it), then `quarto render scripts/species_estimation.qmd`. Render succeeded, including the f1_error_estimates chunk.
+- Found: the qmd writes to results/species_estimation_qmd/20261007, so the render overwrote about 30 existing outputs there (figures, richness/domain/phylum TSVs, frequency ratios, globdb summaries; all now dated 2026-11-12 10:18-10:19) and scripts/species_estimation.html. wrangling.RData (cache), figure_captions.md, globdb_marker_distances_100/3000.png and globdb_nearest_species.tsv were not touched. No backup or snapshot found. Same cached data and seed, but the breakaway version may differ from the October one, so richness estimates may differ.
+- Decided: agent error (should have pointed output_dir at a new dated directory before rendering); remedy pending user.
