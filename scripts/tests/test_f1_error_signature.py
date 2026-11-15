@@ -79,7 +79,7 @@ class Tests(unittest.TestCase):
                 "sum_hits": [100, 1, 100],
             }).write_csv(counts, separator="\t")
             with open(clusters, "w") as fh:
-                fh.write(f"{REP}\t{REP}\n{REP}\t{normalised}\n{REP}\t{member2}\n")
+                fh.write(f"{REP}\t{REP}\n{gapped}\t{REP}\n{member2}\t{REP}\n")
             self.assertEqual(build_pairs(counts, clusters, out), 1)
             row = pl.read_parquet(out).row(0, named=True)
             self.assertEqual(row["member"], normalised)

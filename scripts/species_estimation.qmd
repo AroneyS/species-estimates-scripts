@@ -18,7 +18,7 @@ library(cowplot)
 library(tidyverse)
 library(here)
 
-output_dir <- here("results", "species_estimation_qmd", "20261007")
+output_dir <- here("results", "species_estimation_qmd", "20261112")
 dir.create(output_dir, recursive = TRUE)
 
 set.seed(42)
@@ -994,7 +994,7 @@ ggsave(here(output_dir, "globdb_marker_distances.png"), globdb_distance_figure,
 # sequence vs its more abundant cluster representative, by sample-count class.
 # Error fraction = (p_ref - p_obs) / (p_ref - p_err), with p_ref from f100+ pairs
 # (same scope, or all samples) and p_err the uniform-substitution expectation.
-f1_input_dir <- here("results", "f1_error_estimation", "20261111")
+f1_input_dir <- here("results", "f1_error_estimation", "20261112")
 f1_f_levels <- c("f1", "f2", "f3", "f4-9", "f10-99", "f100+")
 f1_scope_labels <- c(all = "All samples", human_gut = "Human gut")
 f1_statistic_labels <- c(codon_position = "Codon position 3", synonymous = "Synonymous", stop_codon = "Stop gain")
@@ -1102,4 +1102,90 @@ f1_result$data_b %>%
     .groups = "drop"
   ) %>%
   write_tsv(here(f1_output_subdir, "error_estimates_stats.tsv"))
+```
+
+```{r richness_error_corrected}
+#-------------------------------------------------------------------------------
+#--- Richness after removing the estimated sequencing-error share of f1
+#-------------------------------------------------------------------------------
+# Assumption: the share of single-read f1 clusters (clusters with exactly one read
+# hit in the cohort) that are sequencing errors equals the error fraction pi
+# estimated for single-read f1 sequences (scripts/f1_error_estimation.smk). That
+# pi is measured on sequences within 2 bp of a more abundant cluster
+# representative, whereas single-read f1 clusters are singletons that are not,
+# so this is an extrapolation and the results are a sensitivity analysis.
+# f1 is reduced by pi * (single-read f1 clusters), pi clamped to [0, 1], rounded;
+# f2 and higher are unchanged. Human gut uses the all-sample f100+ reference.
+single_read_clusters <- read_tsv(here(f1_input_dir, "single_read_clusters.tsv"), show_col_types = FALSE) %>%
+  transmute(marker, cohort = if_else(scope == "all", "all", "human-gut"), n_single_read_clusters)
+
+f1_pi <- f1_estimates %>%
+  filter(f_class == "f1", single_read, parent_class == "all",
+         scope == "all" | (scope == "human_gut" & reference == "all")) %>%
+  transmute(marker, cohort = if_else(scope == "all", "all", "human-gut"),
+            estimator = f1_statistic_labels[statistic],
+            error_fraction, pi = pmin(pmax(error_fraction, 0), 1))
+
+breakaway_corrected <- function(marker_name, cohort_name, pi_value) {
+  frequencies <- get_frequency_table(marker_name, cohort_name)
+  f1_row <- frequencies$frequency == 1
+  f1 <- frequencies$count[f1_row]
+  single_read <- single_read_clusters %>%
+    filter(marker == marker_name, cohort == cohort_name) %>%
+    pull(n_single_read_clusters)
+  removed <- min(round(pi_value * single_read), f1)
+  frequencies$count[f1_row] <- f1 - removed
+  fit <- tryCatch(breakaway(frequencies), error = function(e) NULL)
+  tibble(
+    f1 = f1, single_read_f1 = single_read, f1_removed = removed,
+    observed_corrected = sum(frequencies$count),
+    breakaway_estimate = if (is.null(fit)) NA_real_ else unname(fit$estimate),
+    breakaway_error = if (is.null(fit)) NA_real_ else unname(fit$error),
+    breakaway_model = if (is.null(fit)) NA_character_ else as.character(fit$model)
+  )
+}
+
+richness_corrected <- bind_rows(
+  # uncorrected reference run (pi = 0)
+  f1_pi %>% distinct(marker, cohort) %>% mutate(estimator = "Uncorrected", error_fraction = 0, pi = 0),
+  f1_pi
+) %>%
+  mutate(fit = pmap(list(marker, cohort, pi), breakaway_corrected)) %>%
+  unnest(fit)
+
+write_tsv(richness_corrected, here(output_dir, "richness_estimates_error_corrected.tsv"))
+
+corrected_levels <- c("Uncorrected", f1_statistic_labels)
+richness_corrected_plot <- richness_corrected %>%
+  mutate(estimator = factor(estimator, levels = corrected_levels),
+         marker = marker_label(marker)) %>%
+  ggplot(aes(marker, breakaway_estimate, colour = estimator)) +
+  geom_point(position = position_dodge(width = .7), size = 1.8) +
+  geom_errorbar(aes(ymin = pmax(0, breakaway_estimate - breakaway_error),
+                    ymax = breakaway_estimate + breakaway_error),
+                position = position_dodge(width = .7), width = .2, na.rm = TRUE) +
+  facet_wrap(~ cohort, scales = "free_y") +
+  scale_colour_manual(values = setNames(c("grey40", bright_colours[1:3]), corrected_levels)) +
+  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+  labs(x = "Marker", y = "Breakaway richness estimate", colour = "f1 error correction") +
+  theme_cowplot() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+ggsave(here(output_dir, "richness_estimates_error_corrected.png"), richness_corrected_plot,
+       width = 15, height = 9, dpi = 300, bg = "white")
+
+# Median and range across markers, relative to the uncorrected estimate
+richness_corrected %>%
+  group_by(marker, cohort) %>%
+  mutate(ratio_to_uncorrected = breakaway_estimate / breakaway_estimate[estimator == "Uncorrected"]) %>%
+  group_by(cohort, estimator) %>%
+  summarise(
+    median_pi = median(pi), median_f1_removed_fraction = median(f1_removed / f1),
+    median_estimate = median(breakaway_estimate, na.rm = TRUE),
+    median_ratio = median(ratio_to_uncorrected, na.rm = TRUE),
+    min_ratio = min(ratio_to_uncorrected, na.rm = TRUE),
+    max_ratio = max(ratio_to_uncorrected, na.rm = TRUE),
+    n_na = sum(is.na(breakaway_estimate)),
+    .groups = "drop"
+  ) %>%
+  write_tsv(here(output_dir, "richness_estimates_error_corrected_summary.tsv"))
 ```

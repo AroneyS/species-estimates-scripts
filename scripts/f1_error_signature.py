@@ -10,8 +10,9 @@ Sequencing errors predict ~uniform mismatches over codon positions, non-synonymo
 excess and stop gains; real variation predicts third-position/synonymous excess.
 
 Inputs: counts table (sequence, n_occurrences, sum_hits; gaps already converted to N, see
-counts_table.py) and smafa clusters.tsv (representative TAB member, no header; members
-have gaps as N, representatives may keep gaps). Windows are 60 bp, in frame.
+counts_table.py) and smafa clusters.tsv (member TAB representative, no header; every unique sequence
+appears once as a member, representatives map to themselves; members keep gaps as written
+in the dedup FASTA, representatives have gaps as N). Windows are 60 bp, in frame.
 Memory: pairs are joined once and written to a temporary parquet, then summarised in
 batches, so 100% of pairs fit in well under 64 GB.
 Codons containing N or gaps in either sequence are excluded from mismatch counts.
@@ -176,7 +177,7 @@ def build_pairs(counts_table: str, clusters: str, output_parquet: str, sample_fr
     Sequences absent from the counts table (e.g. not seen in the scope) drop out.
     """
     counts = pl.scan_csv(counts_table, separator="\t").select("sequence", "n_occurrences", "sum_hits")
-    clu = pl.scan_csv(clusters, separator="\t", has_header=False, new_columns=["rep", "member"]).with_columns(
+    clu = pl.scan_csv(clusters, separator="\t", has_header=False, new_columns=["member", "rep"]).with_columns(
         pl.col("rep").str.replace_all("-", "N"), pl.col("member").str.replace_all("-", "N"))
 
     members = counts.rename({"sequence": "member"})
@@ -217,7 +218,7 @@ def main(arguments):
     parser.add_argument("--quiet", help="only output errors", action="store_true")
 
     parser.add_argument("--counts-table", required=True, help="TSV: sequence, n_occurrences, sum_hits")
-    parser.add_argument("--clusters", required=True, help="smafa clusters.tsv (rep TAB member)")
+    parser.add_argument("--clusters", required=True, help="smafa clusters.tsv (member TAB rep)")
     parser.add_argument("--marker", required=True, help="Marker name, written to output")
     parser.add_argument("--scope", required=True, help="Sample scope (e.g. all, human_gut), written to output")
     parser.add_argument("--sample-fraction", type=float, default=1.0,

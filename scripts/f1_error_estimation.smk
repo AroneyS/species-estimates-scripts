@@ -32,6 +32,7 @@ import os
 PIXI = os.path.abspath(os.path.join(workflow.basedir, "..", "pixi.toml"))
 PROJECT = os.path.abspath(os.path.join(workflow.basedir, ".."))
 SIGNATURE = os.path.join(workflow.basedir, "f1_error_signature.py")
+SINGLE_READ = os.path.join(workflow.basedir, "single_read_clusters.py")
 COUNTS = os.path.join(workflow.basedir, "counts_table.py")
 ESTIMATES = os.path.join(workflow.basedir, "f1_error_estimates.py")
 
@@ -62,12 +63,22 @@ rule all:
         "collated_signature.tsv",
         "error_estimates.tsv",
         "error_estimates_all_reference.tsv",
+        "single_read_clusters.tsv",
 
 rule collate:
     input:
         expand("{marker}/{scope}/signature.tsv", marker = MARKERS, scope = SCOPES),
     output:
         "collated_signature.tsv",
+    localrule: True
+    shell:
+        "awk 'FNR==1 && NR!=1 {{next}} {{print}}' {input} > {output}"
+
+rule collate_single_read:
+    input:
+        expand("{marker}/{scope}/single_read_clusters.tsv", marker = MARKERS, scope = SCOPES),
+    output:
+        "single_read_clusters.tsv",
     localrule: True
     shell:
         "awk 'FNR==1 && NR!=1 {{next}} {{print}}' {input} > {output}"
@@ -207,4 +218,28 @@ rule signature:
         "POLARS_MAX_THREADS={threads} pixi run --manifest-path {params.pixi} python {params.script} "
         "--counts-table {input.counts} --clusters {input.clusters} "
         "--marker {wildcards.marker} --scope {wildcards.scope} --sample-fraction {params.fraction} "
+        "--output {output} &> {log}"
+
+rule single_read_clusters:
+    """Clusters with exactly one hit in the scope: the single-read f1 clusters."""
+    input:
+        counts = "{marker}/{scope}/counts.tsv",
+        clusters = RUN_DIR + "/{marker}/clusters.tsv",
+    output:
+        "{marker}/{scope}/single_read_clusters.tsv",
+    threads: 8
+    resources:
+        mem_mb=40000,
+        runtime = lambda wildcards, attempt: 4*60*attempt,
+    params:
+        pixi = PIXI,
+        script = SINGLE_READ,
+    log:
+        "logs/single_read_clusters/{marker}/{scope}.log"
+    benchmark:
+        "benchmarks/single_read_clusters/{marker}/{scope}.txt"
+    shell:
+        "POLARS_MAX_THREADS={threads} pixi run --manifest-path {params.pixi} python {params.script} "
+        "--counts-table {input.counts} --clusters {input.clusters} "
+        "--marker {wildcards.marker} --scope {wildcards.scope} "
         "--output {output} &> {log}"
