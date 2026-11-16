@@ -73,3 +73,29 @@ Entry template:
 - Found: clusters.tsv is member TAB representative (col 1: 46.9M distinct sequences for S3.1; col 2: 20.0M distinct representatives, each mapping to itself). f1_error_signature.py, single_read_clusters.py and the copies in scripts/checks/f1-error-correction/ read it as rep TAB member. Effect: classes were defined by the representative's count and only pairs with a member more abundant than its representative were kept (2.8M vs 17.5M pairs for S3.1 all). All results in results/f1_error_estimation/20261111/ (collated_signature, error_estimates*.tsv, single_read_clusters.tsv, Figure S11 and everything reported from them) are INVALID. single_read_clusters.tsv gave n_clusters = 46.9M and more single-read clusters than f1, which exposed it.
 - Ran: fixed scripts/f1_error_signature.py, scripts/single_read_clusters.py and their tests (16 pass); S3.1 check in results/f1_error_estimation/20261112 gives 20.05M clusters, single-read clusters 12.09M of 13.32M f1 (all) and 1.38M of 1.39M (human gut), matching the 91.6% / 99.5% noted earlier. Full rerun (13 markers x 2 scopes) launched to 20261112.
 - Decided: old 20261111 results left in place and marked invalid; scripts/checks/f1-error-correction/ left unchanged as the frozen record (still carries the bug); confirmed.md f1-error-correction outcome withdrawn pending the rerun. By agent.
+
+## 2026-11-16: corrected richness refitted with Poisson only
+
+- Ran: scripts/species_estimation.qmd chunk richness_error_corrected now reports poisson_model() (cutoff 10) for every scenario and keeps the default breakaway() fit as breakaway_*; rendered to results/species_estimation_qmd/20261116/ (new dated directory; wrangling.RData copied). f1 data from results/f1_error_estimation/20261112.
+- Found: uncorrected frequency tables never converge under Kemp, so breakaway() falls back to Poisson for all 26 fits. After removing error singletons the f2/f1 ratio rises (S3.1 all: 0.18 -> 0.33; neighbouring ratios 0.43, 0.58), Kemp (model_1_1) converges and is selected; its estimate is 190M with SE 184M (vs Poisson 17M), so the earlier 3-4x increases were a model switch. Poisson: uncorrected equals breakaway() for all markers.
+- Decided: Poisson-only is the primary corrected estimate (user request); breakaway() default retained in the TSV for reference. By agent.
+
+## 2026-11-16: stop gain dropped from the richness correction; Kemp/Poisson plots split
+
+- Ran: scripts/species_estimation.qmd chunk richness_error_corrected rendered to results/species_estimation_qmd/20261116_2/ (new directory; 20261116 left as the previous render). Stop-gain scenario removed from the correction (still in Figure S11); breakaway() default fits plotted separately for non-Poisson models (richness_estimates_error_corrected_breakaway_kemp.png) and Poisson fallbacks (..._breakaway_poisson.png); model counts in richness_estimates_error_corrected_models.tsv.
+- Found: non-Poisson default fits: all samples 10/13 (codon position) and 12/13 (synonymous) Kemp; human gut 11 Kemp + 2 Negative Binomial (codon position), 5 Kemp + 6 Negative Binomial (synonymous). All-sample Kemp fits have SE close to the estimate (up to ~190M); human gut non-Poisson fits are tight at about 0.5-1.1M.
+- Decided: stop gain excluded because OrfM ends ORFs at stop codons so most stop-creating errors are never observed (user). Added as a design fact in CLAUDE.md.
+
+## 2026-11-16: error-corrected richness uses the synonymous estimator only
+
+- Ran: scripts/species_estimation.qmd chunk richness_error_corrected restricted to the synonymous error fraction (all-sample f100+ reference for human gut), rendered to results/species_estimation_qmd/20261116_3/ (new directory).
+- Decided: synonymous only, by user (codon position is not independent of it and gives nearly the same pi; stop gain excluded because of OrfM).
+
+## 2026-11-16: error-corrected richness plot shows default breakaway() fits
+
+- Ran: scripts/species_estimation.qmd rendered to results/species_estimation_qmd/20261116_4/ (new directory; 20261116_3 left unchanged). richness_estimates_error_corrected.png now plots default breakaway() estimates with shape = selected model; the Poisson-only plot is richness_estimates_error_corrected_poisson_model.png.
+- Decided: by user (plot change); agent wrote to a new directory instead of overwriting 20261116_3.
+
+## 2026-11-16: error bars aligned in the error-corrected richness plot
+
+- Ran: scripts/species_estimation.qmd rendered to results/species_estimation_qmd/20261116_5/ (new directory). Cause of the misalignment: the shape aesthetic split the point groups and reordered the dodge, while error bars were grouped by estimator only; fixed with group = estimator.

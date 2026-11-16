@@ -16,6 +16,7 @@
 - Samples are not independent (shared studies/projects, repeated sampling): pseudoreplication caveat for incidence-based estimates.
 - Human gut f1 are more often single-read (99.5% vs 91.6% overall): likely sequencing errors inflating f1.
 - GlobDB reps link to ~4 clusters on average; clustering GlobDB at 2 bp gives ~64% of its species count (over- and under-estimates species).
+- SingleM windows come from OrfM ORFs, which end at stop codons, so errors that create a stop codon are mostly unobserved: stop-gain rates understate error and are not used for error corrections.
 - Collection-year analyses only include samples with a recorded year.
 - Two samples (SRR6660867, SRR34339285) failed in the GTDB r232 run and were removed.
 

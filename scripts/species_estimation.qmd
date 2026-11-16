@@ -18,7 +18,7 @@ library(cowplot)
 library(tidyverse)
 library(here)
 
-output_dir <- here("results", "species_estimation_qmd", "20261112")
+output_dir <- here("results", "species_estimation_qmd", "20261116_5")
 dir.create(output_dir, recursive = TRUE)
 
 set.seed(42)
@@ -1116,16 +1116,30 @@ f1_result$data_b %>%
 # so this is an extrapolation and the results are a sensitivity analysis.
 # f1 is reduced by pi * (single-read f1 clusters), pi clamped to [0, 1], rounded;
 # f2 and higher are unchanged. Human gut uses the all-sample f100+ reference.
+# Only the synonymous estimator is used here. The stop-gain estimator is shown in
+# Figure S11 but not used: SingleM extracts windows from ORFs found by OrfM, which
+# end at stop codons, so most errors that create a stop codon are never observed
+# and the stop-gain error fraction is underestimated. The codon-position estimator
+# is not used either: it is not independent of the synonymous one (third-position
+# changes are mostly synonymous) and gives nearly the same pi.
 single_read_clusters <- read_tsv(here(f1_input_dir, "single_read_clusters.tsv"), show_col_types = FALSE) %>%
   transmute(marker, cohort = if_else(scope == "all", "all", "human-gut"), n_single_read_clusters)
 
 f1_pi <- f1_estimates %>%
-  filter(f_class == "f1", single_read, parent_class == "all",
+  filter(f_class == "f1", single_read, parent_class == "all", statistic == "synonymous",
          scope == "all" | (scope == "human_gut" & reference == "all")) %>%
   transmute(marker, cohort = if_else(scope == "all", "all", "human-gut"),
             estimator = f1_statistic_labels[statistic],
             error_fraction, pi = pmin(pmax(error_fraction, 0), 1))
 
+# Default breakaway() tries Kemp first and falls back (Kemp -> weighted linear
+# regression -> Chao-Bunge -> Poisson). The uncorrected frequency tables never
+# converge under Kemp, so breakaway() returns the Poisson model for every
+# marker; after removing error singletons the f2/f1 ratio is smoother, Kemp
+# converges and breakaway() switches to a model with a very different (and very
+# uncertain) estimate. To compare like with like, every scenario is fitted with
+# the Poisson model (truncated at f10, breakaway's default cutoff), reported as
+# poisson_*; the default breakaway() fit is kept as breakaway_* for reference.
 breakaway_corrected <- function(marker_name, cohort_name, pi_value) {
   frequencies <- get_frequency_table(marker_name, cohort_name)
   f1_row <- frequencies$frequency == 1
@@ -1135,13 +1149,17 @@ breakaway_corrected <- function(marker_name, cohort_name, pi_value) {
     pull(n_single_read_clusters)
   removed <- min(round(pi_value * single_read), f1)
   frequencies$count[f1_row] <- f1 - removed
-  fit <- tryCatch(breakaway(frequencies), error = function(e) NULL)
+  poisson_fit <- poisson_model(frequencies)
+  default_fit <- tryCatch(breakaway(frequencies), error = function(e) NULL)
   tibble(
     f1 = f1, single_read_f1 = single_read, f1_removed = removed,
     observed_corrected = sum(frequencies$count),
-    breakaway_estimate = if (is.null(fit)) NA_real_ else unname(fit$estimate),
-    breakaway_error = if (is.null(fit)) NA_real_ else unname(fit$error),
-    breakaway_model = if (is.null(fit)) NA_character_ else as.character(fit$model)
+    poisson_estimate = unname(poisson_fit$estimate),
+    poisson_error = unname(poisson_fit$error),
+    poisson_lambda = poisson_fit$other$lambda_hat,
+    breakaway_estimate = if (is.null(default_fit)) NA_real_ else unname(default_fit$estimate),
+    breakaway_error = if (is.null(default_fit)) NA_real_ else unname(default_fit$error),
+    breakaway_model = if (is.null(default_fit)) NA_character_ else as.character(default_fit$model)
   )
 }
 
@@ -1155,36 +1173,80 @@ richness_corrected <- bind_rows(
 
 write_tsv(richness_corrected, here(output_dir, "richness_estimates_error_corrected.tsv"))
 
-corrected_levels <- c("Uncorrected", f1_statistic_labels)
-richness_corrected_plot <- richness_corrected %>%
-  mutate(estimator = factor(estimator, levels = corrected_levels),
-         marker = marker_label(marker)) %>%
-  ggplot(aes(marker, breakaway_estimate, colour = estimator)) +
-  geom_point(position = position_dodge(width = .7), size = 1.8) +
-  geom_errorbar(aes(ymin = pmax(0, breakaway_estimate - breakaway_error),
-                    ymax = breakaway_estimate + breakaway_error),
-                position = position_dodge(width = .7), width = .2, na.rm = TRUE) +
-  facet_wrap(~ cohort, scales = "free_y") +
-  scale_colour_manual(values = setNames(c("grey40", bright_colours[1:3]), corrected_levels)) +
-  scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
-  labs(x = "Marker", y = "Breakaway richness estimate", colour = "f1 error correction") +
-  theme_cowplot() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
-ggsave(here(output_dir, "richness_estimates_error_corrected.png"), richness_corrected_plot,
+# The uncorrected Poisson fit should equal the uncorrected breakaway() result
+poisson_check <- richness_corrected %>%
+  filter(estimator == "Uncorrected") %>%
+  inner_join(richness_results, by = c("marker", "cohort"), suffix = c("", "_main")) %>%
+  filter(abs(poisson_estimate - breakaway_estimate_main) > 1)
+if (nrow(poisson_check) > 0) warning("Uncorrected Poisson differs from breakaway() for ", nrow(poisson_check), " fits")
+
+corrected_levels <- c("Uncorrected", f1_statistic_labels[["synonymous"]])
+plot_richness_corrected <- function(data, estimate, error, y_label, shape = NULL) {
+  plot <- data %>%
+    mutate(estimator = factor(estimator, levels = corrected_levels),
+           marker = marker_label(marker)) %>%
+    # group = estimator keeps points and error bars dodged identically; without it
+    # the shape aesthetic splits the point groups and reorders them
+    ggplot(aes(marker, .data[[estimate]], colour = estimator, group = estimator)) +
+    geom_errorbar(aes(ymin = pmax(0, .data[[estimate]] - .data[[error]]),
+                      ymax = .data[[estimate]] + .data[[error]]),
+                  position = position_dodge(width = .7), width = .2, na.rm = TRUE) +
+    facet_wrap(~ cohort, scales = "free_y") +
+    scale_colour_manual(values = setNames(c("grey40", bright_colours[2]), corrected_levels), drop = FALSE) +
+    scale_y_continuous(labels = scales::label_number(scale_cut = scales::cut_short_scale())) +
+    labs(x = "Marker", y = y_label, colour = "f1 error correction", shape = "breakaway() model") +
+    theme_cowplot() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
+  if (is.null(shape)) {
+    plot + geom_point(position = position_dodge(width = .7), size = 1.8)
+  } else {
+    plot + geom_point(aes(shape = .data[[shape]]), position = position_dodge(width = .7), size = 1.8)
+  }
+}
+
+# Default breakaway() fit for every scenario (shape = model it selected)
+ggsave(here(output_dir, "richness_estimates_error_corrected.png"),
+       plot_richness_corrected(richness_corrected, "breakaway_estimate", "breakaway_error",
+                               "Richness estimate (breakaway())", shape = "breakaway_model"),
        width = 15, height = 9, dpi = 300, bg = "white")
+
+# Poisson model fitted to every scenario (like for like)
+ggsave(here(output_dir, "richness_estimates_error_corrected_poisson_model.png"),
+       plot_richness_corrected(richness_corrected, "poisson_estimate", "poisson_error",
+                               "Richness estimate (Poisson model)"),
+       width = 15, height = 9, dpi = 300, bg = "white")
+
+# Default breakaway() fits, split by the model it selected: fits that stayed
+# with Kemp (or another non-Poisson model) and fits that fell back to Poisson
+ggsave(here(output_dir, "richness_estimates_error_corrected_breakaway_kemp.png"),
+       plot_richness_corrected(richness_corrected %>% filter(breakaway_model != "Poisson"),
+                               "breakaway_estimate", "breakaway_error",
+                               "Richness estimate (breakaway(), non-Poisson fits)",
+                               shape = "breakaway_model"),
+       width = 15, height = 9, dpi = 300, bg = "white")
+ggsave(here(output_dir, "richness_estimates_error_corrected_breakaway_poisson.png"),
+       plot_richness_corrected(richness_corrected %>% filter(breakaway_model == "Poisson"),
+                               "breakaway_estimate", "breakaway_error",
+                               "Richness estimate (breakaway(), Poisson fallback fits)"),
+       width = 15, height = 9, dpi = 300, bg = "white")
+
+richness_corrected %>%
+  count(cohort, estimator, breakaway_model) %>%
+  write_tsv(here(output_dir, "richness_estimates_error_corrected_models.tsv"))
 
 # Median and range across markers, relative to the uncorrected estimate
 richness_corrected %>%
   group_by(marker, cohort) %>%
-  mutate(ratio_to_uncorrected = breakaway_estimate / breakaway_estimate[estimator == "Uncorrected"]) %>%
+  mutate(ratio_to_uncorrected = poisson_estimate / poisson_estimate[estimator == "Uncorrected"]) %>%
   group_by(cohort, estimator) %>%
   summarise(
     median_pi = median(pi), median_f1_removed_fraction = median(f1_removed / f1),
-    median_estimate = median(breakaway_estimate, na.rm = TRUE),
+    median_estimate = median(poisson_estimate, na.rm = TRUE),
+    n_breakaway_non_poisson = sum(breakaway_model != "Poisson", na.rm = TRUE),
     median_ratio = median(ratio_to_uncorrected, na.rm = TRUE),
     min_ratio = min(ratio_to_uncorrected, na.rm = TRUE),
     max_ratio = max(ratio_to_uncorrected, na.rm = TRUE),
-    n_na = sum(is.na(breakaway_estimate)),
+    n_na = sum(is.na(poisson_estimate)),
     .groups = "drop"
   ) %>%
   write_tsv(here(output_dir, "richness_estimates_error_corrected_summary.tsv"))
